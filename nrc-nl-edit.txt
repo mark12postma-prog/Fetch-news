@@ -44,7 +44,10 @@ class NRC(BasicNewsRecipe):
     no_stylesheets = True
     ignore_duplicate_articles = {'url'}
     delay = 0.3
-
+    useHighResImages = False
+    compress_news_images = True
+    compress_news_images_auto_size = 5
+    scale_news_images_to_device = True
     touchscreen = True
 
     frontpage = None
