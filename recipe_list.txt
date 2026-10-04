@@ -1,2 +1,2 @@
-nrc.nl
-ad
+nrc.nl.recipe
+ad.recipe
