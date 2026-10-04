@@ -10,7 +10,7 @@ from calibre.web.feeds.recipes import BasicNewsRecipe
 
 
 class NRC(BasicNewsRecipe):
-    title = 'NRC'
+    title = 'NRC-edit'
     __author__ = 'Cristi Ghera'
     max_articles_per_feed = 100
     description = 'NRC - Nieuws, achtergronden en onderzoeksjournalistiek'
