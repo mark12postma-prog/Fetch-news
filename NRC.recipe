@@ -10,7 +10,7 @@ from calibre.web.feeds.recipes import BasicNewsRecipe
 
 
 class NRC(BasicNewsRecipe):
-    title = 'NRC-edit'
+    title = 'NRC'
     __author__ = 'Mark Postma'
     max_articles_per_feed = 100
     description = 'NRC - Nieuws, achtergronden en onderzoeksjournalistiek'
@@ -22,7 +22,8 @@ class NRC(BasicNewsRecipe):
 
     # remove_tags_before = {'class': 'article__header-and-content'}
     remove_tags_before = [dict(id='main-content')]
-    remove_tags_after = {'class': 'article__header-and-content'}
+    remove_tags_after = [dict(id='main-content')]
+    # remove_tags_after = {'class': 'article__header-and-content'}
     # remove_tags_after = [dict(name='ic-forward')]
 
     remove_tags = [
@@ -41,16 +42,16 @@ class NRC(BasicNewsRecipe):
                 ]
             }
         ),
-        dict(name=['script', 'noscript', 'style']),
+        dict(name=['script', 'noscript', 'style', 'svg']),
     ]
-    remove_attributes = ['class', 'id', 'name', 'style']
+    remove_attributes = ['class', 'style']
     encoding = 'utf-8'
     no_stylesheets = True
     ignore_duplicate_articles = {'url'}
     delay = 0.3
     useHighResImages = False
     compress_news_images = True
-    compress_news_images_auto_size = 10
+    compress_news_images_auto_size = 16
 
     touchscreen = True
 
