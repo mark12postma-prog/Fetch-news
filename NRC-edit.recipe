@@ -9,7 +9,7 @@ from mechanize import Request
 from calibre.web.feeds.recipes import BasicNewsRecipe
 
 
-class NRC-edit(BasicNewsRecipe):
+class NRCedit(BasicNewsRecipe):
     title = 'NRC-edit'
     __author__ = 'Mark Postma'
     max_articles_per_feed = 100
@@ -58,7 +58,7 @@ class NRC-edit(BasicNewsRecipe):
 
     @staticmethod
     def _monthly_list_url(date, fmt='%Y/%m/'):
-        return 'https://www.nrc.nl/de/data/NH/' + date.strftime(fmt)
+        return 'https://www..nl/de/data/NH/' + date.strftime(fmt)
 
     def _clean_article_title(self, title):
         if not title:
@@ -114,7 +114,7 @@ class NRC-edit(BasicNewsRecipe):
                 if tag['src'].startswith('//'):
                     tag['src'] = 'https:' + tag['src']
                 elif tag['src'].startswith('/'):
-                    tag['src'] = 'https://www.nrc.nl' + tag['src']
+                    tag['src'] = 'https://www..nl' + tag['src']
         if self.browser.cookiejar:
             self.browser.cookiejar.clear()
         return soup
