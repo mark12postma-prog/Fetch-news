@@ -20,10 +20,10 @@ class NRC(BasicNewsRecipe):
     category = 'news, politics, Netherlands'
     resolve_internal_links = True
 
-    remove_tags_before = {'class': 'article__header-and-content'}
-
-    remove_tags_after = {'class': 'article__header-and-content'}
-
+    # remove_tags_before = {'class': 'article__header-and-content'}
+    remove_tage_before = [dict(id='main-content')]
+    # remove_tags_after = {'class': 'article__header-and-content'}
+    remove_tags_after = [dict(name='ic-forward')]
 
     remove_tags = [
         dict(
@@ -60,7 +60,7 @@ class NRC(BasicNewsRecipe):
 
     @staticmethod
     def _monthly_list_url(date, fmt='%Y/%m/'):
-        return 'https://www..nl/de/data/NH/' + date.strftime(fmt)
+        return 'https://www.nrc.nl/de/data/NH/' + date.strftime(fmt)
 
     def _clean_article_title(self, title):
         if not title:
