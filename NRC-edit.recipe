@@ -106,6 +106,16 @@ class NRC(BasicNewsRecipe):
             sections.append((section['name'], articles))
         return sections
 
+
+def preprocess_raw_html(self, raw_html, url):
+    i = raw_html.rfind('Lees ook')
+    if i == -1:
+        self.log('LEESOOK: not found in raw HTML for', url)
+    else:
+        self.log('LEESOOK:', url, repr(raw_html[max(0, i - 800): i + 300]))
+    return raw_html
+
+
     def preprocess_html(self, soup):
         for tag in soup():
             if tag.name == 'img':
