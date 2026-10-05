@@ -21,7 +21,7 @@ class NRC(BasicNewsRecipe):
     resolve_internal_links = True
 
     # remove_tags_before = {'class': 'article__header-and-content'}
-    remove_tage_before = [dict(id='main-content')]
+    remove_tags_before = [dict(id='main-content')]
     # remove_tags_after = {'class': 'article__header-and-content'}
     remove_tags_after = [dict(name='ic-forward')]
 
@@ -116,7 +116,7 @@ class NRC(BasicNewsRecipe):
                 if tag['src'].startswith('//'):
                     tag['src'] = 'https:' + tag['src']
                 elif tag['src'].startswith('/'):
-                    tag['src'] = 'https://www..nl' + tag['src']
+                    tag['src'] = 'https://www.nrc.nl' + tag['src']
         if self.browser.cookiejar:
             self.browser.cookiejar.clear()
         return soup
