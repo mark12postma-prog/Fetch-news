@@ -19,8 +19,12 @@ class NRC(BasicNewsRecipe):
     country = 'NL'
     category = 'news, politics, Netherlands'
     resolve_internal_links = True
-    remove_tags_before = [dict(id='main-content')]
-    remove_tags_after = [dict(name='ic-forward')]
+
+    remove_tags_before = {'class': 'article__header-and-content'}
+
+    remove_tags_after = {'class': 'article__header-and-content'}
+
+
     remove_tags = [
         dict(
             attrs={
