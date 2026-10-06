@@ -42,7 +42,7 @@ class NRC(BasicNewsRecipe):
                 ]
             }
         ),
-        dict(name=['script', 'noscript', 'style', 'svg']),
+        dict(name=['script', 'noscript', 'name', 'id', 'style', 'svg']),
     ]
     remove_attributes = ['class', 'style']
     encoding = 'utf-8'
@@ -52,7 +52,7 @@ class NRC(BasicNewsRecipe):
     useHighResImages = False
     compress_news_images = True
     compress_news_images_auto_size = 16
-
+    auto_cleanup = True
     touchscreen = True
 
     frontpage = None
