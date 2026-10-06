@@ -22,5 +22,5 @@ class LeeuwarderCourant(BasicNewsRecipe):
     ignore_duplicate_articles = {'title', 'url'}
 
     feeds = [
-        ('Leeuwarder Courant', 'https://www.lc.nl/api/feed/rss'),
+        ('Leeuwarder Courant', 'https://www.lc.nl/rss'),
     ]
