@@ -40,7 +40,7 @@ class NRC(BasicNewsRecipe):
     # Images
     no_stylesheets = True
     compress_news_images = True
-    compress_news_images_auto_size = 24
+    compress_news_images_auto_size = 200
 
     # The article header (title, intro, first image) is not a sibling of the
     # text block, and every part of it has "header" in its class name, which
