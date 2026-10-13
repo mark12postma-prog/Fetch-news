@@ -103,7 +103,8 @@ class NRC(BasicNewsRecipe):
                 if len(issues) > 0:
                     issue_date = datetime.datetime.strptime(issues[0]['published_at'], '%Y-%m-%dT%H:%M:%SZ')
                     issue_url = self._monthly_list_url(issue_date, '%Y/%m/%d/')
-                    self.frontpage = issues[0]['frontpage']
+                    # self.frontpage = issues[0]['frontpage']
+                    self.frontpage = issues[0]['frontpage_images']['full']
                     break
         if issue_url is None:
             return []
