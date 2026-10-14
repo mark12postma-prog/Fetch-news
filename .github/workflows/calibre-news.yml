@@ -151,7 +151,8 @@ jobs:
             echo 'No ebook needs send'; exit 1
           fi
 
-      - name: Prepare ebooks for Google Drive
+
+      - name: Prepare ebooks for Dropbox
         if: ${{ success() }}
         id: prepare_ebooks
         shell: bash
@@ -161,9 +162,11 @@ jobs:
           EXT: ${{ env.ext }}
         run: |
           set -euo pipefail
-
-          upload_dir="$RUNNER_TEMP/ebooks-to-upload"
+          upload_dir="$GITHUB_WORKSPACE/ebooks-to-upload"
           mkdir -p "$upload_dir"
+
+          # Remove files left over from a previous run in this workspace.
+          find "$upload_dir" -maxdepth 1 -type f -delete
 
           count=0
           while IFS= read -r -d '' ebook_path; do
@@ -181,16 +184,21 @@ jobs:
           done < <(find "$OUTPUT_DIR" -type f -name "*.${EXT,,}" -print0)
 
           echo "count=$count" >> "$GITHUB_OUTPUT"
-          echo "Upload directory: $upload_dir"
           echo "Prepared $count ebook(s)"
 
-      - name: Upload ebooks to Google Drive
+      - name: Upload ebooks to Dropbox
         if: ${{ success() && steps.prepare_ebooks.outputs.count != '0' }}
-        uses: Jumbo810/Upload_Github_Artifacts_TO_GDrive@v2.3.5
+        uses: git9527/deploy-to-dropbox@v22
         with:
-          target: "${{ runner.temp }}/ebooks-to-upload/*"
-          credentials: ${{ secrets.GDRIVE_CREDENTIALS }}
-          parent_folder_id: ${{ secrets.GDRIVE_FOLDER }}
+          DROPBOX_APP_KEY: ${{ secrets.DROPBOX_APP_KEY }}
+          DROPBOX_APP_SECRET: ${{ secrets.DROPBOX_APP_SECRET }}
+          DROPBOX_REFRESH_TOKEN: ${{ secrets.DROPBOX_REFRESH_TOKEN }}
+          DROPBOX_DESTINATION_PATH_PREFIX: /Calibre-News
+          DROPBOX_UPLOAD_MODE: override
+          GLOB_PATTERN: ebooks-to-upload/*
+          IGNORE_LOCAL_PATH: true
+          DEBUG: false
+
 
       - name: Storing Ebook
         if: ${{ success() }}
