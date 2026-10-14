@@ -190,7 +190,7 @@ jobs:
         with:
           target: "${{ runner.temp }}/ebooks-to-upload/*"
           credentials: ${{ secrets.GDRIVE_CREDENTIALS }}
-          parent_folder_id: ${{ secrets.GDRIVE_FOLDER_ID }}
+          parent_folder_id: ${{ secrets.GDRIVE_FOLDER }}
 
       - name: Storing Ebook
         if: ${{ success() }}
