@@ -23,6 +23,7 @@ def _keep_div(name):
 
 
 _KEYWORD_RE = re.compile(r'<span class="keyword">([^<]+)</span>\s*')
+_CREDIT_RE = re.compile(r"foto(?:’s|'s|s)?\b", re.I)
 
 
 class NRC(BasicNewsRecipe):
@@ -87,6 +88,28 @@ class NRC(BasicNewsRecipe):
         dict(name=['script', 'noscript', 'style', 'dmt-util-bar']),
     ]
     remove_attributes = ['class', 'id', 'name', 'style']
+
+    extra_css = '''
+        h1 { font-size: 1.5em; line-height: 1.15; margin: 0.4em 0; }
+        h2 { font-size: 1.05em; margin: 1.2em 0 0.3em 0;
+             page-break-after: avoid; }
+        p { margin: 0; text-indent: 1.2em; text-align: justify;
+            hyphens: auto; line-height: 1.4; orphans: 2; widows: 2; }
+        h2 + p, p.nrc-caption + p, p.nrc-credit + p { text-indent: 0; }
+        p.nrc-label { text-indent: 0; text-align: left; color: #444;
+                      font-variant: small-caps; letter-spacing: 0.08em; }
+        p.nrc-intro { text-indent: 0; text-align: left; font-style: italic;
+                      font-size: 1.05em; margin: 0.2em 0 0.8em 0;
+                      padding-bottom: 0.6em; border-bottom: 0.5pt solid #888; }
+        p.nrc-img { text-indent: 0; text-align: center;
+                    margin-top: 0.8em; page-break-inside: avoid; }
+        img { max-width: 100%; }
+        p.nrc-caption, p.nrc-credit { text-indent: 0; text-align: right;
+                    font-size: 0.8em; font-style: italic; color: #444;
+                    hyphens: none; }
+        p.nrc-credit { margin-bottom: 0.8em; }
+    '''
+
 
     frontpage = None
 
@@ -208,6 +231,43 @@ class NRC(BasicNewsRecipe):
         if self.browser.cookiejar:
             self.browser.cookiejar.clear()
         return soup
+
+    def postprocess_html(self, soup, first_fetch):
+        for p in soup.find_all('p'):
+            if not p.get_text(strip=True) and not p.find('img'):
+                p.decompose()
+
+        h1 = soup.find('h1')
+        if h1 is not None:
+            ps = h1.find_all_next('p', limit=3)
+            if len(ps) == 3:
+                label, extra, intro = ps
+                lt = label.get_text(' ', strip=True)
+                if len(lt) <= 25 and extra.get_text(' ', strip=True).startswith(lt):
+                    extra.decompose()
+                    label['class'] = 'nrc-label'
+                    intro['class'] = 'nrc-intro'
+
+        for p in soup.find_all('p'):
+            if not p.find('img'):
+                continue
+            p['class'] = 'nrc-img'
+            cap = p.find_next('p')
+            if cap is None or cap.find('img') or cap.get('class'):
+                continue
+            ct = cap.get_text(' ', strip=True)
+            if len(ct) > 300:
+                continue
+            if _CREDIT_RE.match(ct):
+                cap['class'] = 'nrc-credit'
+                continue
+            cap['class'] = 'nrc-caption'
+            cred = cap.find_next('p')
+            if cred is not None and len(cred.get_text(strip=True)) < 80 \
+                    and _CREDIT_RE.match(cred.get_text(' ', strip=True)):
+                cred['class'] = 'nrc-credit'
+        return soup
+
 
     def get_cover_url(self):
         return self.frontpage
