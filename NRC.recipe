@@ -2,6 +2,8 @@
 import datetime
 import json
 import re
+import io
+from PIL import Image
 from contextlib import closing
 
 from lxml import html as lxml_html
@@ -38,9 +40,23 @@ class NRC(BasicNewsRecipe):
     touchscreen = True
 
     # Images
+    # no_stylesheets = True
+    # compress_news_images = True
+    # compress_news_images_auto_size = 16
+
+    # Images: handled in preprocess_image() below, so calibre's own
+    # scaling/compression is off (otherwise images are processed twice).
     no_stylesheets = True
-    compress_news_images = True
-    compress_news_images_auto_size = 16
+    compress_news_images = False
+    scale_news_images_to_device = False
+    scale_news_images = None
+
+    screen_size = (1264, 1680)  # Kobo Libra Colour, portrait (px)
+    base_quality = 90           # quality of the scaled reference JPEG
+    extra_compression = 4       # x times smaller than that reference
+    min_quality = 35            # floor: no image gets worse than this
+
+
 
     # The article header (title, intro, first image) is not a sibling of the
     # text block, and every part of it has "header" in its class name, which
@@ -140,6 +156,44 @@ class NRC(BasicNewsRecipe):
         except Exception:
             self.log.exception('Could not move the article header for %s' % url)
         return raw_html
+
+    @staticmethod
+    def _jpeg(img, quality):
+        buf = io.BytesIO()
+        img.save(buf, 'JPEG', quality=quality, optimize=True)
+        return buf.getvalue()
+
+    def preprocess_image(self, img_data, image_url):
+        try:
+            img = Image.open(io.BytesIO(img_data))
+            if img.mode in ('RGBA', 'LA') or (
+                    img.mode == 'P' and 'transparency' in img.info):
+                img = img.convert('RGBA')
+                bg = Image.new('RGB', img.size, (255, 255, 255))
+                bg.paste(img, mask=img.getchannel('A'))
+                img = bg
+            elif img.mode not in ('RGB', 'L'):
+                img = img.convert('RGB')
+
+            # 1. Scale down to the screen (never up)
+            img.thumbnail(self.screen_size, Image.LANCZOS)
+
+            # 2. Reference size, then find the highest quality that is
+            #    extra_compression times smaller than it
+            target = len(self._jpeg(img, self.base_quality)) / self.extra_compression
+            lo, hi, best = self.min_quality, self.base_quality, None
+            while lo <= hi:
+                mid = (lo + hi) // 2
+                data = self._jpeg(img, mid)
+                if len(data) <= target:
+                    best, lo = data, mid + 1
+                else:
+                    hi = mid - 1
+            return best or self._jpeg(img, self.min_quality)
+        except Exception:
+            self.log.exception('Could not process image %s' % image_url)
+            return img_data
+
 
     def preprocess_html(self, soup):
         for img in soup.findAll('img'):
