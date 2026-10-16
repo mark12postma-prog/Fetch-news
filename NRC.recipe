@@ -4,6 +4,7 @@ import json
 import re
 import io
 from PIL import Image
+from PIL import ImageEnhance
 from contextlib import closing
 
 from lxml import html as lxml_html
@@ -203,6 +204,10 @@ class NRC(BasicNewsRecipe):
 
             # 1. Scale down to the screen (never up)
             img.thumbnail(self.screen_size, Image.LANCZOS)
+            if img.mode == 'RGB':
+            img = ImageEnhance.Color(img).enhance(1.15)
+            img = ImageEnhance.Contrast(img).enhance(1.05)
+
 
             # 2. Reference size, then find the highest quality that is
             #    extra_compression times smaller than it
