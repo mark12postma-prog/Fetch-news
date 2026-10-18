@@ -71,6 +71,7 @@ class Volkskrant(BasicNewsRecipe):
     language = 'nl'
     country = 'NL'
     category = 'news, politics, Netherlands'
+    browser_type = 'camoufox'
     encoding = 'utf-8'
     max_articles_per_feed = 100
     resolve_internal_links = True
