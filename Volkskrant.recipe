@@ -65,8 +65,8 @@ def _slug_title(url):
 
 
 class Volkskrant(BasicNewsRecipe):
-    title = 'de Volkskrant'
-    __author__ = 'Modelled on the NRC recipe'
+    title = 'Volkskrant'
+    __author__ = 'Mark Postma'
     description = 'de Volkskrant - de krant van vandaag, in de volgorde van de papieren krant'
     language = 'nl'
     country = 'NL'
