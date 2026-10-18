@@ -549,8 +549,13 @@ class Volkskrant(BasicNewsRecipe):
         return buf.getvalue()
 
     def preprocess_image(self, img_data, image_url):
+        self.log('Image start: %s (%d bytes)' % (image_url, len(img_data)))
         try:
             img = Image.open(io.BytesIO(img_data))
+            self.log(
+                'Image decoded: %s format=%s mode=%s size=%s'
+                % (image_url, img.format, img.mode, img.size)
+            )
             if img.mode in ('RGBA', 'LA') or (
                     img.mode == 'P' and 'transparency' in img.info):
                 img = img.convert('RGBA')
@@ -577,7 +582,13 @@ class Volkskrant(BasicNewsRecipe):
                     best, lo = data, mid + 1
                 else:
                     hi = mid - 1
-            return best or self._jpeg(img, self.min_quality)
+            # return best or self._jpeg(img, self.min_quality)
+            out = best or self._jpeg(img, self.min_quality)
+            self.log(
+                'Image processed: %s %d -> %d bytes'
+                % (image_url, len(img_data), len(out))
+            )
+            return out
         except Exception:
             self.log.exception('Could not process image %s' % image_url)
             return img_data
