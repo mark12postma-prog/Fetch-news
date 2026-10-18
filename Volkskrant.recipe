@@ -7,6 +7,12 @@ from urllib.parse import parse_qs, quote, unquote, urljoin, urlsplit
 
 from lxml import etree
 from lxml import html as lxml_html
+
+try:
+    import pillow_avif  # Registers AVIF support with Pillow
+except ImportError:
+    pass
+
 from PIL import Image, ImageEnhance
 
 from calibre.web.feeds.recipes import BasicNewsRecipe
@@ -87,9 +93,9 @@ class Volkskrant(BasicNewsRecipe):
     scale_news_images = None
 
     screen_size = (1264, 1680)  # Kobo Libra Colour, portrait (px)
-    base_quality = 70           # quality of the scaled reference JPEG
-    extra_compression = 8       # x times smaller than that reference
-    min_quality = 15            # floor: no image gets worse than this
+    base_quality = 90           # quality of the scaled reference JPEG
+    extra_compression = 4       # x times smaller than that reference
+    min_quality = 25            # floor: no image gets worse than this
     max_image_width = 1600      # biggest srcset candidate we bother to download
 
     # The article is rebuilt from scratch in preprocess_raw_html(), so no
