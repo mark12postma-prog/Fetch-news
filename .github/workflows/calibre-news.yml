@@ -170,6 +170,10 @@ jobs:
             calibre-smtp -a "$ebook_path" -r "$relay" --port="$port" \
               -e "${encrypt^^}" -u "$from" -p "$secret" -s "$title" \
               "$from" "$to" "Deliver \"${title}\""
+
+            echo "Waiting 30 seconds before next email"
+            sleep 30
+    
           done < <(find "$output" -type f -name "*.${ext,,}" -print0)
           echo "All jobs done"
       - name: Storing Ebook
