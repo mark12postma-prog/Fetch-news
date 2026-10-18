@@ -8,11 +8,6 @@ from urllib.parse import parse_qs, quote, unquote, urljoin, urlsplit
 from lxml import etree
 from lxml import html as lxml_html
 
-try:
-    import pillow_avif  # Registers AVIF support with Pillow
-except ImportError:
-    pass
-
 from PIL import Image, ImageEnhance
 
 from calibre.web.feeds.recipes import BasicNewsRecipe
@@ -77,7 +72,8 @@ class Volkskrant(BasicNewsRecipe):
     language = 'nl'
     country = 'NL'
     category = 'news, politics, Netherlands'
-    browser_type = 'camoufox'
+    # browser_type = 'camoufox'
+    browser_type = 'qt'
     encoding = 'utf-8'
     max_articles_per_feed = 100
     resolve_internal_links = True
