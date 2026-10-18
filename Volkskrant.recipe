@@ -26,8 +26,10 @@ COVER_URL = 'https://digitalekrant.volkskrant.nl/volkskrant/teasers/7929/medium.
 _ISSUE_ID_RE = re.compile(r'/titles/volkskrant/(\d+)')
 
 # Volkskrant article URLs look like /<section>/<slug>~b1a2b3c4d/
-_ARTICLE_PATH_RE = re.compile(r'^(?:/[^/?#]+)+~b[0-9a-f]{6,12}/?$')
-_ARTICLE_SCAN_RE = re.compile(r'(?:https?://(?:www\.)?volkskrant\.nl)?(/(?:[\w\-]+/)+[\w\-]+~b[0-9a-f]{6,12}/?)')
+#_ARTICLE_PATH_RE = re.compile(r'^(?:/[^/?#]+)+~b[0-9a-f]{6,12}/?$')
+_ARTICLE_PATH_RE = re.compile(r'^(?:/[^/?#]+)+~(?:b[0-9a-f]{6,12}|v[0-9]+)/?$')
+#_ARTICLE_SCAN_RE = re.compile(r'(?:https?://(?:www\.)?volkskrant\.nl)?(/(?:[\w\-]+/)+[\w\-]+~b[0-9a-f]{6,12}/?)')
+_ARTICLE_SCAN_RE = re.compile(r'(?:https?://(?:www\.)?volkskrant\.nl)?'r'(/(?:[\w\-]+/)+[\w\-]+~(?:b[0-9a-f]{6,12}|v[0-9]+)/?)')
 
 # Page furniture, matched against class / id / data-testid (strict pass only)
 _JUNK_CLS = re.compile(
