@@ -16,7 +16,8 @@ INDEX_PATH = '/krant/digitaal/vandaag/'
 GATE_HOST = 'myprivacy.dpgmedia.nl'
 # Front page of the latest issue: the title page redirects to .../titles/volkskrant/<id>
 TITLE_URL = 'https://krant.volkskrant.nl/titles/volkskrant'
-COVER_URL = 'https://digitalekrant.volkskrant.nl/volkskrant/teasers/%s/medium.jpg'
+# COVER_URL = 'https://digitalekrant.volkskrant.nl/volkskrant/teasers/%s/medium.jpg'
+COVER_URL = 'https://digitalekrant.volkskrant.nl/volkskrant/teasers/7929/medium.jpg'
 _ISSUE_ID_RE = re.compile(r'/titles/volkskrant/(\d+)')
 
 # Volkskrant article URLs look like /<section>/<slug>~b1a2b3c4d/
@@ -305,18 +306,24 @@ class Volkskrant(BasicNewsRecipe):
     def get_cover_url(self):
         # krant.volkskrant.nl/titles/volkskrant redirects to .../titles/volkskrant/<id>
         # for the latest issue; that id gives the front-page image.
-        try:
-            with closing(self.browser.open(TITLE_URL)) as r:
-                final = r.geturl()
-                body = r.read().decode('utf-8', 'replace')
+        
+        #self.log('Cover: looking up the latest issue at %s' % TITLE_URL)
+        #try:
+        #    with closing(self.browser.open(TITLE_URL)) as r:
+        #        final = r.geturl()
+        #        body = r.read().decode('utf-8', 'replace')
             # redirect target first; if the redirect happens in the page itself, look in there
-            m = _ISSUE_ID_RE.search(final) or _ISSUE_ID_RE.search(body)
-            if m:
-                return COVER_URL % m.group(1)
-            self.log.warn('No issue id found at %s (ended up at %s)' % (TITLE_URL, final))
-        except Exception:
-            self.log.exception('Could not determine cover')
-        return None
+        #    m = _ISSUE_ID_RE.search(final) or _ISSUE_ID_RE.search(body)
+        #    if m:
+        #        self.log('Cover: issue %s' % m.group(1))
+        #        return COVER_URL % m.group(1)
+        #    self.log.warn('No issue id found at %s (ended up at %s)' % (TITLE_URL, final))
+        #    self.log.warn('Page starts with: %r' % body[:300])
+        #except Exception:
+        #    self.log.exception('Could not determine cover')
+        #return None
+        self.log('Cover: using fixed cover URL %s' % COVER_URL)
+        return COVER_URL
 
     # ------------------------------------------------------------------
     # Articles: rebuild a clean page from the article markup
