@@ -8,6 +8,10 @@ from urllib.parse import parse_qs, quote, unquote, urljoin, urlsplit
 from lxml import etree
 from lxml import html as lxml_html
 
+import os
+import subprocess
+import tempfile
+
 from PIL import Image, ImageEnhance
 
 from calibre.web.feeds.recipes import BasicNewsRecipe
@@ -550,13 +554,32 @@ class Volkskrant(BasicNewsRecipe):
         img.save(buf, 'JPEG', quality=quality, optimize=True)
         return buf.getvalue()
 
+    def _decode_avif(self, img_data):
+        # Decode AVIF bytes to PNG bytes using avifdec.
+        with tempfile.TemporaryDirectory() as tmp:
+            src = os.path.join(tmp, 'input.avif')
+            dst = os.path.join(tmp, 'output.png')
+
+            with open(src, 'wb') as f:
+                f.write(img_data)
+
+            subprocess.run(
+                ['avifdec', src, dst],
+                check=True,
+                capture_output=True,
+            )
+
+            with open(dst, 'rb') as f:
+                return f.read()
+
     def preprocess_image(self, img_data, image_url):
-        self.log(
-            'Image %s: %d bytes, first bytes=%s'
-            % (image_url, len(img_data), img_data[:24].hex())
-        )
         try:
-            img = Image.open(io.BytesIO(img_data))
+            # AVIF detection: bytes 4:8 are 'ftyp', bytes 8:12 are usually 'avif'
+            if img_data[4:8] == b'ftyp' and img_data[8:12] == b'avif':
+                self.log('AVIF image detected: %s' % image_url)
+                img_data = self._decode_avif(img_data)
+
+        img = Image.open(io.BytesIO(img_data))
             self.log(
                 'Image decoded: %s format=%s mode=%s size=%s'
                 % (image_url, img.format, img.mode, img.size)
