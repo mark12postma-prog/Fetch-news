@@ -571,18 +571,19 @@ class Volkskrant(BasicNewsRecipe):
             with open(dst, 'rb') as f:
                 return f.read()
 
-    def preprocess_image(self, img_data, image_url):
+        def preprocess_image(self, img_data, image_url):
         try:
             # AVIF detection: bytes 4:8 are 'ftyp', bytes 8:12 are usually 'avif'
             if img_data[4:8] == b'ftyp' and img_data[8:12] == b'avif':
                 self.log('AVIF image detected: %s' % image_url)
                 img_data = self._decode_avif(img_data)
 
-        img = Image.open(io.BytesIO(img_data))
+            img = Image.open(io.BytesIO(img_data))
             self.log(
                 'Image decoded: %s format=%s mode=%s size=%s'
                 % (image_url, img.format, img.mode, img.size)
             )
+
             if img.mode in ('RGBA', 'LA') or (
                     img.mode == 'P' and 'transparency' in img.info):
                 img = img.convert('RGBA')
@@ -598,10 +599,10 @@ class Volkskrant(BasicNewsRecipe):
                 img = ImageEnhance.Color(img).enhance(1.15)
                 img = ImageEnhance.Contrast(img).enhance(1.05)
 
-            # 2. Reference size, then find the highest quality that is
-            #    extra_compression times smaller than it
+            # 2. Find the highest JPEG quality that meets the size target
             target = len(self._jpeg(img, self.base_quality)) / self.extra_compression
             lo, hi, best = self.min_quality, self.base_quality, None
+
             while lo <= hi:
                 mid = (lo + hi) // 2
                 data = self._jpeg(img, mid)
@@ -609,16 +610,24 @@ class Volkskrant(BasicNewsRecipe):
                     best, lo = data, mid + 1
                 else:
                     hi = mid - 1
-            # return best or self._jpeg(img, self.min_quality)
+
             out = best or self._jpeg(img, self.min_quality)
             self.log(
                 'Image processed: %s %d -> %d bytes'
                 % (image_url, len(img_data), len(out))
             )
             return out
+
+        except subprocess.CalledProcessError as e:
+            self.log.error(
+                'avifdec failed for %s: %s'
+                % (image_url, e.stderr.decode('utf-8', 'replace'))
+            )
+            return None
+
         except Exception:
             self.log.exception('Could not process image %s' % image_url)
-            return img_data
+            return None
 
 
 calibre_most_common_ua = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36'
