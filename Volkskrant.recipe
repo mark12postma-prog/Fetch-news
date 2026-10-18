@@ -1,0 +1,578 @@
+#!/usr/bin/env python
+import copy
+import io
+import re
+from contextlib import closing
+from urllib.parse import parse_qs, quote, unquote, urljoin, urlsplit
+
+from lxml import etree
+from lxml import html as lxml_html
+from PIL import Image, ImageEnhance
+
+from calibre.web.feeds.recipes import BasicNewsRecipe
+
+BASE = 'https://www.volkskrant.nl'
+INDEX_PATH = '/krant/digitaal/vandaag/'
+GATE_HOST = 'myprivacy.dpgmedia.nl'
+# Front page of the latest issue: the title page redirects to .../titles/volkskrant/<id>
+TITLE_URL = 'https://krant.volkskrant.nl/titles/volkskrant'
+COVER_URL = 'https://digitalekrant.volkskrant.nl/volkskrant/teasers/%s/medium.jpg'
+_ISSUE_ID_RE = re.compile(r'/titles/volkskrant/(\d+)')
+
+# Volkskrant article URLs look like /<section>/<slug>~b1a2b3c4d/
+_ARTICLE_PATH_RE = re.compile(r'^(?:/[^/?#]+)+~b[0-9a-f]{6,12}/?$')
+_ARTICLE_SCAN_RE = re.compile(r'(?:https?://(?:www\.)?volkskrant\.nl)?(/(?:[\w\-]+/)+[\w\-]+~b[0-9a-f]{6,12}/?)')
+
+# Page furniture, matched against class / id / data-testid (strict pass only)
+_JUNK_CLS = re.compile(
+    r'(?<![a-z])(share|social|newsletter|signup|promo|related|recommend|lees-?ook|read-?more|'
+    r'advert|adslot|ad-slot|banner|footer|comment|toolbar|util|breadcrumb|podcast|player|'
+    r'sidebar|cookie|consent|popup|modal|byline|author|dateline|keyword|topics?|most-?read|'
+    r'sponsor|login|teaser)', re.I)
+_INTRO_CLS = re.compile(r'(?<![a-z])(intro|subtitle|standfirst|lead|abstract|summary|subhead)(?![a-z])', re.I)
+_DROP_TAGS = {'script', 'noscript', 'style', 'svg', 'button', 'form', 'iframe', 'nav', 'footer',
+              'aside', 'audio', 'video', 'template', 'dialog', 'select', 'input'}
+
+_SKIP_BLOCK_RE = re.compile(r'^(lees ook|lees meer|zie ook|kijk ook)\b', re.I)
+_STOP_HEAD_RE = re.compile(r'^(reacties|gerelateerd|meer van|meest gelezen|aanbevolen|ook interessant|lees ook)\b', re.I)
+_BYLINE_RE = re.compile(r'^(door|tekst|gepubliceerd|bijgewerkt|verslaggever)\b', re.I)
+_PAYWALL_RE = re.compile(r'(word abonnee|lees verder met|inloggen|log in|bekijk onze abonnementen|'
+                         r'voorbehouden aan abonnees|alleen voor abonnees)', re.I)
+_CREDIT_RE = re.compile(r'^(.*)\b(Beeld|Foto|Fotografie|Illustratie)\s+([^.]{2,60})$', re.S)
+_INLINE_KEEP = {'em', 'strong', 'i', 'b', 'br', 'sup', 'sub'}
+
+
+def _squash(text):
+    return ' '.join((text or '').split())
+
+
+def _article_url(href):
+    '''Absolute article URL for an href, or None when it is not a Volkskrant article.'''
+    if not href:
+        return None
+    parts = urlsplit(urljoin(BASE + '/', href.strip()))
+    if parts.netloc not in ('www.volkskrant.nl', 'volkskrant.nl'):
+        return None
+    if not _ARTICLE_PATH_RE.match(parts.path):
+        return None
+    return BASE + parts.path.rstrip('/') + '/'
+
+
+def _slug_title(url):
+    slug = urlsplit(url).path.rstrip('/').rsplit('/', 1)[-1].split('~')[0]
+    return slug.replace('-', ' ').capitalize()
+
+
+class Volkskrant(BasicNewsRecipe):
+    title = 'de Volkskrant'
+    __author__ = 'Modelled on the NRC recipe'
+    description = 'de Volkskrant - de krant van vandaag, in de volgorde van de papieren krant'
+    language = 'nl'
+    country = 'NL'
+    category = 'news, politics, Netherlands'
+    encoding = 'utf-8'
+    max_articles_per_feed = 100
+    resolve_internal_links = True
+    ignore_duplicate_articles = {'url'}
+    delay = 0.3
+    touchscreen = True
+
+    # Images: handled in preprocess_image() below, so calibre's own
+    # scaling/compression is off (otherwise images are processed twice).
+    no_stylesheets = True
+    compress_news_images = False
+    scale_news_images_to_device = False
+    scale_news_images = None
+
+    screen_size = (1264, 1680)  # Kobo Libra Colour, portrait (px)
+    base_quality = 90           # quality of the scaled reference JPEG
+    extra_compression = 4       # x times smaller than that reference
+    min_quality = 35            # floor: no image gets worse than this
+    max_image_width = 1600      # biggest srcset candidate we bother to download
+
+    # The article is rebuilt from scratch in preprocess_raw_html(), so no
+    # auto_cleanup / keep_only_tags / remove_tags are needed.
+    auto_cleanup = False
+
+    # Headings on the index page that are not part of the printed paper.
+    skip_sections = ('meest gelezen', 'meest gedeeld', 'aanbevolen', 'nieuwsbrief',
+                     'abonneer', 'ook interessant')
+
+    extra_css = '''
+        h1, h2 { hyphens: none; text-align: left; page-break-after: avoid; }
+        h1 { font-size: 1.44em; line-height: 1.15; margin: 0.4em 0 0.5em 0; }
+        h2 { font-size: 1.2em; line-height: 1.2; margin: 1.4em 0 0.4em 0; }
+        p { margin: 0; text-indent: 1.2em; text-align: justify;
+            hyphens: auto; orphans: 2; widows: 2; }
+        h1 + p, h2 + p, p.vk-caption + p, p.vk-credit + p { text-indent: 0; }
+        p.vk-label { text-indent: 0; text-align: left; color: #444;
+                     font-variant: small-caps; letter-spacing: 0.08em;
+                     hyphens: none; }
+        p.vk-intro { text-indent: 0; text-align: left; font-style: italic;
+                     font-size: 1.1em; line-height: 1.3;
+                     margin: 0.2em 0 0.8em 0; padding-bottom: 0.6em;
+                     border-bottom: 0.5pt solid #888; }
+        p.vk-img { text-indent: 0; text-align: center; margin-top: 0.8em;
+                   page-break-inside: avoid; page-break-after: avoid; }
+        img { max-width: 100%; }
+        p.vk-caption, p.vk-credit { text-indent: 0; text-align: right;
+                   font-size: 0.83em; font-style: italic; color: #444;
+                   hyphens: none; }
+        p.vk-credit { margin-bottom: 0.8em; }
+        blockquote { margin: 0.8em 1.5em; font-style: italic; }
+        blockquote p { text-indent: 0; }
+    '''
+
+    _index_html = ''
+
+    # ------------------------------------------------------------------
+    # Index: today's paper, in printed order
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _is_gate(url):
+        return urlsplit(url).netloc == GATE_HOST
+
+    @staticmethod
+    def _original_url(url):
+        '''The article URL behind a privacy-gate URL (or the URL itself).'''
+        if urlsplit(url).netloc != GATE_HOST:
+            return url
+        try:
+            callback = parse_qs(urlsplit(url).query)['callbackUrl'][0]
+            path = parse_qs(urlsplit(callback).query)['redirectUri'][0]
+            return urljoin(BASE + '/', unquote(path))
+        except Exception:
+            return url
+
+    def _fetch_page(self, url, br=None):
+        '''GET a page. When DPG's privacy gate (myprivacy.dpgmedia.nl) intercepts,
+        follow its callback URL, which is what pressing "Akkoord" does. That sets
+        the consent cookie on volkskrant.nl, after which the page loads normally.'''
+        br = br or self.browser
+        url = self._original_url(url)
+        with closing(br.open(url)) as r:
+            final = r.geturl()
+            data = r.read().decode('utf-8', 'replace')
+        if not self._is_gate(final):
+            return data
+        callback = (parse_qs(urlsplit(final).query).get('callbackUrl') or [None])[0]
+        if not callback:
+            path = urlsplit(url).path
+            callback = BASE + '/privacygate-confirm?redirectUri=' + quote(path, safe='').replace('~', '%7E')
+        self.log('Privacy gate hit, confirming via %s' % callback)
+        with closing(br.open(callback)) as r:
+            r.read()
+        with closing(br.open(url)) as r:
+            final = r.geturl()
+            data = r.read().decode('utf-8', 'replace')
+        if self._is_gate(final):
+            self.log.warn('Still on the privacy gate after confirming: %s' % final)
+        return data
+
+    @staticmethod
+    def _parse(raw):
+        try:
+            return lxml_html.fromstring(raw)
+        except ValueError:  # unicode string with an encoding declaration
+            try:
+                return lxml_html.fromstring(raw.encode('utf-8'))
+            except Exception:
+                return None
+        except Exception:
+            return None
+
+    def _section_name(self, el):
+        '''Text of a heading if it is a section heading, else None.'''
+        for anc in el.iterancestors():
+            if anc.tag in ('article', 'nav', 'footer'):
+                return None  # teaser kicker, menu, footer
+            if anc.tag == 'a' and _article_url(anc.get('href')):
+                return None  # headline inside an article link
+        for a in el.iter('a'):
+            if _article_url(a.get('href')):
+                return None  # headline wrapping an article link
+        name = _squash(el.text_content())
+        if not name or len(name) > 40:
+            return None
+        return name
+
+    @staticmethod
+    def _anchor_title(a, url):
+        '''(title, from_slug) for an article link.'''
+        for h in a.xpath('.//h1|.//h2|.//h3|.//h4|.//h5'):
+            t = _squash(h.text_content())
+            if t:
+                return t, False
+        for anc in a.iterancestors():
+            if anc.tag in ('h1', 'h2', 'h3', 'h4', 'h5'):
+                t = _squash(anc.text_content())
+                if t:
+                    return t, False
+                break
+        t = _squash(a.get('aria-label') or a.get('title') or '') or _squash(a.text_content())
+        if t:
+            if len(t) > 140:
+                t = t[:137].rsplit(' ', 1)[0] + '…'
+            return t, False
+        return _slug_title(url), True
+
+    def _parse_sections(self, raw):
+        root = self._parse(raw)
+        if root is None:
+            return []
+        sections = []    # [(name, [article, ...])] in page order
+        named = {}       # name -> article list
+        by_url = {}      # url -> article dict
+        slug_titled = set()
+        current = None   # article list we are adding to
+        skipping = False
+        for el in root.iter():
+            tag = el.tag
+            if not isinstance(tag, str):
+                continue
+            if tag in ('h2', 'h3', 'h4'):
+                name = self._section_name(el)
+                if not name:
+                    continue
+                skipping = any(s in name.lower() for s in self.skip_sections)
+                if not skipping:
+                    if name not in named:
+                        named[name] = []
+                        sections.append((name, named[name]))
+                    current = named[name]
+            elif tag == 'a':
+                url = _article_url(el.get('href'))
+                if not url or skipping:
+                    continue
+                if any(a.tag in ('nav', 'footer') for a in el.iterancestors()):
+                    continue
+                title, from_slug = self._anchor_title(el, url)
+                if url in by_url:
+                    if url in slug_titled and not from_slug:
+                        by_url[url]['title'] = title
+                        slug_titled.discard(url)
+                    continue
+                if current is None:
+                    named['Volkskrant'] = current = []
+                    sections.append(('Volkskrant', current))
+                art = dict(title=title, url=url)
+                by_url[url] = art
+                current.append(art)
+                if from_slug:
+                    slug_titled.add(url)
+        return [(name, arts) for name, arts in sections if arts]
+
+    def _scan_for_urls(self, raw):
+        '''Last resort: any article URL anywhere in the page source (e.g. inside JSON).'''
+        text = raw.replace('\\/', '/').replace('\\u002F', '/')
+        articles, seen = [], set()
+        for m in _ARTICLE_SCAN_RE.finditer(text):
+            url = _article_url(m.group(1))
+            if url and url not in seen:
+                seen.add(url)
+                articles.append(dict(title=_slug_title(url), url=url))
+        return [('Volkskrant', articles)] if articles else []
+
+    def parse_index(self):
+        html = ''
+        try:
+            html = self._fetch_page(BASE + INDEX_PATH)
+        except Exception:
+            self.log.exception('Could not open %s' % (BASE + INDEX_PATH))
+        sections = self._parse_sections(html)
+        if not sections:
+            self.log.warn('No article links with section headings found')
+        self._index_html = html
+        if not sections and html:
+            self.log.warn('Falling back to scanning the page source for article URLs')
+            sections = self._scan_for_urls(html)
+        if not sections:
+            self.log.error('No articles found. Page starts with: %r' % html[:300])
+            return []
+        total = sum(len(a) for _, a in sections)
+        self.log('Found %d articles in %d sections' % (total, len(sections)))
+        for name, arts in sections:
+            self.log('  %s: %d' % (name, len(arts)))
+        # Get the consent cookie now, so the parallel article downloads don't all
+        # hit the privacy gate at once.
+        try:
+            self._fetch_page(sections[0][1][0]['url'])
+        except Exception:
+            self.log.exception('Could not warm up the privacy-gate consent')
+        return sections
+
+    def get_cover_url(self):
+        # krant.volkskrant.nl/titles/volkskrant redirects to .../titles/volkskrant/<id>
+        # for the latest issue; that id gives the front-page image.
+        try:
+            with closing(self.browser.open(TITLE_URL)) as r:
+                final = r.geturl()
+                body = r.read().decode('utf-8', 'replace')
+            # redirect target first; if the redirect happens in the page itself, look in there
+            m = _ISSUE_ID_RE.search(final) or _ISSUE_ID_RE.search(body)
+            if m:
+                return COVER_URL % m.group(1)
+            self.log.warn('No issue id found at %s (ended up at %s)' % (TITLE_URL, final))
+        except Exception:
+            self.log.exception('Could not determine cover')
+        return None
+
+    # ------------------------------------------------------------------
+    # Articles: rebuild a clean page from the article markup
+    # ------------------------------------------------------------------
+
+    def _image_url(self, node, img, page_url):
+        '''Best usable image URL for an <img> (or <picture>/<figure> around it).'''
+        cands = []   # (width, url)
+        sources = [img] + (list(node.iter('source')) if node is not img else [])
+        for el in sources:
+            for attr in ('srcset', 'data-srcset'):
+                for u, w in re.findall(r'(\S+)\s+(\d+)w', el.get(attr) or ''):
+                    cands.append((int(w), u))
+        plain = img.get('src') or img.get('data-src') or ''
+        url = plain
+        if cands:
+            small = [c for c in cands if c[0] <= self.max_image_width]
+            # biggest candidate within the limit, else the smallest one available
+            url = max(small)[1] if small else min(cands)[1]
+        if not url or url.startswith('data:'):
+            url = plain
+        if not url or url.startswith('data:') or url.lower().split('?')[0].endswith('.svg'):
+            return None
+        for dim in ('width', 'height'):
+            v = (img.get(dim) or '').strip()
+            if v.isdigit() and int(v) < 60:
+                return None  # icon / avatar
+        return urljoin(page_url, url)
+
+    @staticmethod
+    def _inline(tag, node):
+        '''Copy of node as a clean <tag> that keeps only basic inline markup.'''
+        node = copy.deepcopy(node)
+        etree.strip_elements(node, etree.Comment, 'script', 'style', 'noscript', 'svg',
+                             'button', 'figure', with_tail=False)
+        drop = {d.tag for d in node.iter() if d is not node and isinstance(d.tag, str)
+                and d.tag not in _INLINE_KEEP}
+        if drop:
+            etree.strip_tags(node, *drop)
+        new = lxml_html.Element(tag)
+        new.text = node.text
+        for child in list(node):
+            new.append(child)
+        for d in new.iter():
+            d.attrib.clear()
+        return new
+
+    def _is_junk(self, el, strict):
+        if el.tag in _DROP_TAGS:
+            return True
+        if strict:
+            ident = ' '.join(filter(None, (el.get('class'), el.get('id'), el.get('data-testid'))))
+            if ident and _JUNK_CLS.search(ident):
+                return True
+        return False
+
+    def _build_article(self, article, page_url, strict):
+        body = lxml_html.Element('div')
+        st = dict(title=False, label=False, intro=False, stop=False, paras=0,
+                  paywall=False, imgs=set())
+
+        def add(tag, text=None, cls=None):
+            el = lxml_html.Element(tag)
+            if text is not None:
+                el.text = text
+            if cls:
+                el.set('class', cls)
+            body.append(el)
+            return el
+
+        def caption(text):
+            m = _CREDIT_RE.match(text)
+            if m:
+                cap, cred = m.group(1).strip(), '%s %s' % (m.group(2), m.group(3).strip())
+                if cap:
+                    add('p', cap, 'vk-caption')
+                add('p', cred, 'vk-credit')
+            else:
+                add('p', text, 'vk-caption')
+
+        def image(node):
+            img = node if node.tag == 'img' else next(node.iter('img'), None)
+            if img is None:
+                return
+            src = self._image_url(node, img, page_url)
+            if not src or src in st['imgs']:
+                return
+            st['imgs'].add(src)
+            p = add('p', None, 'vk-img')
+            etree.SubElement(p, 'img').set('src', src)
+            if node.tag == 'figure':
+                cap = node.find('.//figcaption')
+                if cap is not None and _squash(cap.text_content()):
+                    caption(_squash(cap.text_content()))
+
+        def header_block(tag, text):
+            if len(text) < 80 and _BYLINE_RE.match(text):
+                return
+            if not st['intro'] and len(text) > 25:
+                add('p', text, 'vk-intro')
+                st['intro'] = True
+            elif not st['intro'] and not st['label']:
+                add('p', text, 'vk-label')
+                st['label'] = True
+
+        def walk(node, in_header):
+            for child in node:
+                if st['stop']:
+                    return
+                tag = child.tag
+                if not isinstance(tag, str) or self._is_junk(child, strict):
+                    continue
+                if tag == 'header':
+                    walk(child, True)
+                elif tag == 'h1':
+                    if not st['title']:
+                        body.append(self._inline('h1', child))
+                        st['title'] = True
+                elif tag in ('figure', 'picture', 'img'):
+                    image(child)
+                elif tag in ('p', 'h2', 'h3', 'h4'):
+                    text = _squash(child.text_content())
+                    if not text:
+                        continue
+                    if tag != 'p' and _STOP_HEAD_RE.match(text):
+                        st['stop'] = True
+                    elif in_header and tag in ('p', 'h2', 'h3'):
+                        header_block(tag, text)
+                    elif _SKIP_BLOCK_RE.match(text):
+                        continue
+                    elif tag == 'p' and len(text) < 200 and _PAYWALL_RE.search(text):
+                        st['paywall'] = True
+                    elif (not st['intro'] and tag in ('p', 'h2', 'h3') and st['title']
+                          and _INTRO_CLS.search(child.get('class') or '') and len(text) > 25):
+                        add('p', text, 'vk-intro')
+                        st['intro'] = True
+                    elif tag == 'p':
+                        body.append(self._inline('p', child))
+                        st['paras'] += 1
+                    else:
+                        body.append(self._inline('h2', child))
+                elif tag == 'blockquote':
+                    text = _squash(child.text_content())
+                    if text:
+                        etree.SubElement(add('blockquote'), 'p').text = text
+                elif tag in ('ul', 'ol') and not in_header:
+                    items = [_squash(li.text_content()) for li in child.findall('li')]
+                    items = [i for i in items if i]
+                    if items:
+                        lst = add(tag)
+                        for i in items:
+                            etree.SubElement(lst, 'li').text = i
+                else:
+                    walk(child, in_header)
+
+        walk(article, False)
+        return body, st
+
+    def preprocess_raw_html(self, raw_html, url):
+        out = self._render(raw_html, url)
+        if out is None:
+            # Probably the privacy gate instead of the article: confirm and refetch.
+            self.log.warn('No article text in %s, retrying via the privacy gate' % url)
+            try:
+                raw2 = self._fetch_page(url, self.clone_browser(self.browser))
+                out = self._render(raw2, url)
+            except Exception:
+                self.log.exception('Refetch failed for %s' % url)
+        if out is None:
+            self.log.warn('Giving up on %s' % url)
+            return ('<html><head><meta charset="utf-8"/><title>Volkskrant</title></head><body>'
+                    '<p>Artikel kon niet worden opgehaald: %s</p></body></html>' % self._original_url(url))
+        return out
+
+    def _render(self, raw_html, url):
+        '''Clean article page for raw_html, or None when it holds no article text.'''
+        root = self._parse(raw_html)
+        if root is None:
+            return None
+        articles = root.xpath('//article')
+        if articles:
+            best, best_len = None, -1
+            for a in articles:   # the real article is the one with the most paragraph text
+                n = len(''.join(a.xpath('.//p//text()')))
+                if n >= best_len:
+                    best, best_len = a, n
+            article = best
+        else:
+            article = (root.xpath('//main') or root.xpath('//body') or [root])[0]
+
+        body = st = None
+        for strict in (True, False):
+            body, st = self._build_article(article, url, strict)
+            if st['paras'] >= 3:
+                break
+            if strict:
+                self.log.warn('Little text found in %s, retrying without class filters' % url)
+        if st['paras'] < 1:
+            return None
+        if st['paywall']:
+            self.log.warn('Paywall text in %s: article is probably truncated' % url)
+        if not st['title']:
+            h1 = root.find('.//h1')
+            if h1 is not None:
+                body.insert(0, self._inline('h1', h1))
+
+        title = _squash(body.findtext('h1') or '') or 'Volkskrant'
+        doc = lxml_html.fromstring(
+            '<html><head><meta charset="utf-8"/><title></title></head><body></body></html>')
+        doc.find('.//title').text = title
+        doc.find('.//body').append(body)
+        return lxml_html.tostring(doc, encoding='unicode')
+
+    # ------------------------------------------------------------------
+    # Images: scale to the screen, then compress a further factor
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _jpeg(img, quality):
+        buf = io.BytesIO()
+        img.save(buf, 'JPEG', quality=quality, optimize=True)
+        return buf.getvalue()
+
+    def preprocess_image(self, img_data, image_url):
+        try:
+            img = Image.open(io.BytesIO(img_data))
+            if img.mode in ('RGBA', 'LA') or (
+                    img.mode == 'P' and 'transparency' in img.info):
+                img = img.convert('RGBA')
+                bg = Image.new('RGB', img.size, (255, 255, 255))
+                bg.paste(img, mask=img.getchannel('A'))
+                img = bg
+            elif img.mode not in ('RGB', 'L'):
+                img = img.convert('RGB')
+
+            # 1. Scale down to the screen (never up)
+            img.thumbnail(self.screen_size, Image.LANCZOS)
+            if img.mode == 'RGB':
+                img = ImageEnhance.Color(img).enhance(1.15)
+                img = ImageEnhance.Contrast(img).enhance(1.05)
+
+            # 2. Reference size, then find the highest quality that is
+            #    extra_compression times smaller than it
+            target = len(self._jpeg(img, self.base_quality)) / self.extra_compression
+            lo, hi, best = self.min_quality, self.base_quality, None
+            while lo <= hi:
+                mid = (lo + hi) // 2
+                data = self._jpeg(img, mid)
+                if len(data) <= target:
+                    best, lo = data, mid + 1
+                else:
+                    hi = mid - 1
+            return best or self._jpeg(img, self.min_quality)
+        except Exception:
+            self.log.exception('Could not process image %s' % image_url)
+            return img_data
+
+
+calibre_most_common_ua = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36'
