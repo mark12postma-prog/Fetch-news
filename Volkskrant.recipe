@@ -549,7 +549,10 @@ class Volkskrant(BasicNewsRecipe):
         return buf.getvalue()
 
     def preprocess_image(self, img_data, image_url):
-        self.log('Image start: %s (%d bytes)' % (image_url, len(img_data)))
+        self.log(
+            'Image %s: %d bytes, first bytes=%s'
+            % (image_url, len(img_data), img_data[:24].hex())
+        )
         try:
             img = Image.open(io.BytesIO(img_data))
             self.log(
