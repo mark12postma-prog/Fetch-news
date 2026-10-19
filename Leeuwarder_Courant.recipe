@@ -1,0 +1,374 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+"""Leeuwarder Courant (Twipe reader) - Calibre BasicNewsRecipe.
+
+Debugging: Calibre recipe debug output shows [LC] log lines for API requests,
+package selection, record counts, image matching, and exceptions.
+
+Optional local images: place downloaded files in a folder named ``sources``
+next to this recipe, or set LC_SOURCES_DIR. Filenames should contain the
+Twipe ExternalContentItemReference, e.g. G354ETGAA.2.jpg.
+"""
+
+import os
+import re
+import json
+import base64
+import mimetypes
+from datetime import datetime
+
+from bs4 import BeautifulSoup
+from calibre.web.feeds.news import BasicNewsRecipe
+
+
+class LeeuwarderCourant(BasicNewsRecipe):
+    title = 'Leeuwarder Courant'
+    __author__ = 'Custom recipe'
+    description = 'Leeuwarder Courant digital edition via the Twipe API'
+    language = 'nl'
+    country = 'nl'
+    publisher = 'Leeuwarder Courant'
+    category = 'news'
+    oldest_article = 1
+    max_articles_per_feed = 500
+    use_embedded_content = False
+    no_stylesheets = True
+    remove_empty_feeds = True
+    recursions = 0
+    simultaneous_downloads = 1
+    timeout = 30
+
+    INDEX_URL = (
+        'https://mhu-lczui-api.prod.twipecloud.net/'
+        'Data/DataService.svc/getcontentpackagelist/MHULCZUILC/0/30'
+    )
+    API_ROOT = (
+        'https://mhu-lczui-api.prod.twipecloud.net/'
+        'Data/DataService.svc'
+    )
+    PUBLICATION_CODE = 'MHULCZUILC'
+
+    extra_css = (
+        'body { font-family: serif; line-height: 1.4; } '
+        'h1 { font-size: 1.6em; margin-bottom: 0.35em; } '
+        'h2 { font-size: 1.25em; } '
+        '.lc-byline { font-style: italic; margin: 0.5em 0; } '
+        '.lc-intro { font-weight: bold; margin: 0.8em 0; } '
+        '.lc-page { color: #666; font-size: 0.85em; margin-bottom: 1em; } '
+        'img { max-width: 100%; height: auto; } '
+        'blockquote { margin-left: 1em; margin-right: 1em; }'
+    )
+
+    def _log(self, message):
+        self.log('[LC] ' + str(message))
+
+    def _warning(self, message):
+        self.log.warning('[LC] ' + str(message))
+
+    def _json_request(self, url):
+        self._log('GET ' + url)
+        try:
+            raw = self.browser.open(url, timeout=self.timeout).read()
+            self._log('Response bytes: %d' % len(raw))
+            return json.loads(raw.decode('utf-8-sig', 'replace'))
+        except Exception as err:
+            self._warning('Request/JSON parse failed for %s: %s' % (url, err))
+            raise
+
+    def _get_json_candidates(self, urls, label):
+        errors = []
+        for url in urls:
+            try:
+                result = self._json_request(url)
+                if isinstance(result, (dict, list)):
+                    self._log('%s succeeded: %s' % (label, url))
+                    return result
+                errors.append('%s returned %s' % (url, type(result).__name__))
+            except Exception as err:
+                errors.append('%s -> %s' % (url, err))
+        raise Exception('%s failed. Tried:\n%s' % (label, '\n'.join(errors)))
+
+    def _packages(self):
+        data = self._json_request(self.INDEX_URL)
+        if isinstance(data, dict):
+            for key in ('ContentPackageList', 'ContentPackages', 'Data', 'Result', 'Items'):
+                if isinstance(data.get(key), list):
+                    data = data[key]
+                    break
+        if not isinstance(data, list):
+            raise Exception('Unexpected package-list response: %r' % type(data))
+        self._log('Package records received: %d' % len(data))
+        for package in data:
+            self._log('Package: id=%s date=%s name=%r format=%r status=%r' % (
+                package.get('ContentPackageId'), package.get('PublicationDate'),
+                package.get('ContentPackageName'), package.get('ContentPackageFormat'),
+                package.get('Status')))
+        return data
+
+    def _date(self, value):
+        if not value:
+            return None
+        try:
+            return datetime.strptime(value[:10], '%Y-%m-%d').date()
+        except Exception:
+            return None
+
+    def _select_package(self, packages):
+        lc = []
+        for package in packages:
+            name = (package.get('ContentPackageName') or '').lower()
+            status = (package.get('Status') or '').lower()
+            if 'leeuwarder courant' not in name:
+                continue
+            if status and status not in ('ok', 'published', 'available'):
+                self._log('Skipping package with non-ready status: %s (%s)' %
+                          (package.get('ContentPackageId'), status))
+                continue
+            lc.append(package)
+        if not lc:
+            raise Exception('No Leeuwarder Courant packages found in API response')
+        daily = [p for p in lc if
+                 (p.get('ContentPackageFormat') or '').lower() == 'daily']
+        candidates = daily or lc
+        candidates.sort(
+            key=lambda p: self._date(p.get('PublicationDate')) or
+                          self._date(p.get('ContentPackagePublishTime')) or
+                          datetime.min.date(),
+            reverse=True)
+        selected = candidates[0]
+        self._log('Selected package id=%s date=%s format=%s' % (
+            selected.get('ContentPackageId'), selected.get('PublicationDate'),
+            selected.get('ContentPackageFormat')))
+        return selected
+
+    def _content_urls(self, package):
+        package_id = str(package.get('ContentPackageId') or '')
+        publication_id = str(package.get('PublicationID') or '')
+        ids = [value for value in (package_id, publication_id) if value]
+        urls = []
+        for ident in ids:
+            urls.extend([
+                '%s/getpublicationcontentitems/%s/%s' %
+                (self.API_ROOT, self.PUBLICATION_CODE, ident),
+                '%s/getpublicationcontentitems/%s' % (self.API_ROOT, ident),
+                '%s/getpublicationcontentitems-%s.json' % (self.API_ROOT, ident),
+                '%s/%s/getpublicationcontentitems-%s.json' %
+                (self.API_ROOT, self.PUBLICATION_CODE, ident),
+                'https://mhu-lczui-webreader-production.twipemobile.com/'
+                'getpublicationcontentitems-%s.json' % ident,
+            ])
+        return list(dict.fromkeys(urls))
+
+    def _content(self, package):
+        data = self._get_json_candidates(
+            self._content_urls(package), 'publication content items')
+        if isinstance(data, dict):
+            content = data.get('Content')
+            if isinstance(content, list):
+                self._log('PublicationID in response: %s' % data.get('PublicationID'))
+                self._log('Content records received: %d' % len(content))
+                return content
+            for key in ('ContentItems', 'Items', 'Data', 'Result'):
+                if isinstance(data.get(key), list):
+                    self._log('Using content array from property %s' % key)
+                    return data[key]
+        if isinstance(data, list):
+            self._log('Content records received: %d' % len(data))
+            return data
+        raise Exception('Unexpected content-items response shape')
+
+    def _local_sources(self):
+        roots = []
+        env_dir = os.environ.get('LC_SOURCES_DIR')
+        if env_dir:
+            roots.append(env_dir)
+        try:
+            roots.append(os.path.join(os.path.dirname(os.path.abspath(__file__)), 'sources'))
+        except Exception:
+            pass
+        roots.extend([os.path.join(os.getcwd(), 'sources'), os.getcwd()])
+        found, seen = [], set()
+        for root in roots:
+            if not root or root in seen or not os.path.isdir(root):
+                continue
+            seen.add(root)
+            self._log('Scanning local image directory: %s' % root)
+            for base, dirs, files in os.walk(root):
+                dirs[:] = [d for d in dirs if d not in ('.git', '__pycache__')]
+                for name in files:
+                    if os.path.splitext(name)[1].lower() in (
+                            '.jpg', '.jpeg', '.png', '.gif', '.webp', '.bmp'):
+                        found.append((name, os.path.join(base, name)))
+        self._log('Local image files indexed: %d' % len(found))
+        return found
+
+    def _normalise_ref(self, value):
+        return re.sub(r'[^A-Z0-9]', '', (value or '').upper())
+
+    def _match_local_image(self, image_ref, files):
+        target = self._normalise_ref(image_ref)
+        if not target:
+            return None
+        for name, path in files:
+            if self._normalise_ref(os.path.splitext(name)[0]) == target:
+                return path
+        for name, path in files:
+            if target in self._normalise_ref(name):
+                return path
+        return None
+
+    def _data_uri(self, path):
+        mime = mimetypes.guess_type(path)[0] or 'image/jpeg'
+        with open(path, 'rb') as stream:
+            payload = base64.b64encode(stream.read()).decode('ascii')
+        return 'data:%s;base64,%s' % (mime, payload)
+
+    def _html_fragment(self, raw):
+        if not raw:
+            return ''
+        # Convert Twipe's custom tags to standard HTML equivalents.
+        raw = re.sub(r'<\s*italic\b[^>]*>', '<em>', raw, flags=re.I)
+        raw = re.sub(r'<\s*/\s*italic\s*>', '</em>', raw, flags=re.I)
+        raw = re.sub(r'<\s*bold\b[^>]*>', '<strong>', raw, flags=re.I)
+        raw = re.sub(r'<\s*/\s*bold\s*>', '</strong>', raw, flags=re.I)
+        raw = re.sub(r'<\s*quote\b[^>]*>', '<blockquote>', raw, flags=re.I)
+        raw = re.sub(r'<\s*/\s*quote\s*>', '</blockquote>', raw, flags=re.I)
+        raw = re.sub(r'<\s*text\b[^>]*>', '', raw, flags=re.I)
+        raw = re.sub(r'<\s*/\s*text\s*>', '', raw, flags=re.I)
+        raw = re.sub(r'<\s*dateline\b[^>]*>', '<span class="lc-dateline">', raw, flags=re.I)
+        raw = re.sub(r'<\s*/\s*dateline\s*>', '</span>', raw, flags=re.I)
+        raw = re.sub(r'<\s*TypographyTag\b[^>]*>', '', raw, flags=re.I)
+        raw = re.sub(r'<\s*/\s*TypographyTag\s*>', '', raw, flags=re.I)
+        return raw
+
+    def _item_by_type(self, record, content_type):
+        for item in record.get('ContentItem', []) or []:
+            if item.get('ContentType') == content_type:
+                return item
+        return None
+
+    def _authors(self, record):
+        authors = []
+        for item in record.get('ContentItem', []) or []:
+            if item.get('ContentType') == 'author/xml' and item.get('Author'):
+                authors.append(item.get('Author').strip())
+        text_item = self._item_by_type(record, 'text/xml')
+        if text_item and text_item.get('Byline'):
+            authors.append(text_item.get('Byline').strip())
+        result, seen = [], set()
+        for name in authors:
+            if name.lower() not in seen:
+                seen.add(name.lower())
+                result.append(name)
+        return ', '.join(result)
+
+    def _build_article_html(self, record, page, local_images):
+        item = self._item_by_type(record, 'text/xml')
+        if not item:
+            return None, None
+        title = (item.get('Title') or '').strip()
+        if not title:
+            title = 'Leeuwarder Courant - pagina %s' % (page or '?')
+        intro = item.get('Introduction') or ''
+        body = item.get('HtmlText') or ''
+        subtitle = (item.get('SubTitle') or '').strip()
+        supertitle = (item.get('SupTitle') or '').strip()
+        author = self._authors(record)
+
+        bits = ['<div class="lc-article">']
+        if supertitle:
+            bits.append('<p class="lc-supertitle">%s</p>' % supertitle)
+        bits.append('<h1>%s</h1>' % title)
+        if subtitle:
+            bits.append('<h2>%s</h2>' % subtitle)
+        if author:
+            bits.append('<p class="lc-byline">%s</p>' % author)
+        if page:
+            bits.append('<p class="lc-page">Pagina %s</p>' % page)
+        if intro and intro.strip() != body.strip():
+            bits.append('<div class="lc-intro">%s</div>' % self._html_fragment(intro))
+        bits.append('<div class="lc-body">%s</div>' % self._html_fragment(body))
+
+        for image_item in record.get('ContentItem', []) or []:
+            if image_item.get('ContentType') != 'image/jpeg':
+                continue
+            ref = image_item.get('ExternalContentItemReference') or ''
+            local = self._match_local_image(ref, local_images)
+            if local:
+                try:
+                    self._log('Image matched: ref=%s file=%s' % (ref, local))
+                    bits.append('<figure><img src="%s" alt=""/></figure>' %
+                                self._data_uri(local))
+                except Exception as err:
+                    self._warning('Could not embed image %s (%s): %s' % (ref, local, err))
+            else:
+                self._warning('No local file matched image ref %r (article %r)' %
+                              (ref, title))
+        bits.append('</div>')
+        return title, ''.join(bits)
+
+    def parse_index(self):
+        self._log('Starting recipe; index URL=%s' % self.INDEX_URL)
+        self.browser = self.get_browser()
+        packages = self._packages()
+        package = self._select_package(packages)
+        records = self._content(package)
+        image_files = self._local_sources()
+        pub_date = self._date(package.get('PublicationDate'))
+        if pub_date:
+            self._log('Publication date: %s' % pub_date.isoformat())
+
+        indexed_records = list(enumerate(records))
+        indexed_records.sort(key=lambda pair: (
+            int(pair[1].get('PageNumber') or 9999), pair[0]))
+        articles = []
+        skipped = 0
+        self._article_html = {}
+        for original_index, record in indexed_records:
+            text_item = self._item_by_type(record, 'text/xml')
+            if not text_item:
+                skipped += 1
+                continue
+            title, html = self._build_article_html(
+                record, record.get('PageNumber'), image_files)
+            if not html:
+                skipped += 1
+                continue
+            key = 'lc-local://%s-%s' % (
+                record.get('ContentID', original_index), original_index)
+            self._article_html[key] = html
+            articles.append({
+                'title': title,
+                'url': key,
+                'date': pub_date,
+                'description': text_item.get('ShortText') or '',
+            })
+
+        self._log('Articles built: %d; skipped records: %d' % (len(articles), skipped))
+        if not articles:
+            raise Exception('No article text was found in the selected publication')
+        date_label = pub_date.isoformat() if pub_date else 'latest edition'
+        self.title = 'Leeuwarder Courant - ' + date_label
+        self._log('Returning one feed with %d articles' % len(articles))
+        return [('Leeuwarder Courant', articles)]
+
+    def get_article(self, url, opener, log):
+        html = getattr(self, '_article_html', {}).get(url)
+        if html is None:
+            self._warning('No cached HTML found for article URL: %s' % url)
+            html = '<p>Artikel niet beschikbaar.</p>'
+        return BeautifulSoup(
+            '<html><head><meta charset="utf-8"/></head><body>%s</body></html>' % html,
+            'html.parser')
+
+    def preprocess_html(self, soup):
+        for paragraph in list(soup.find_all('p')):
+            if not paragraph.get_text(' ', strip=True) and not paragraph.find('img'):
+                paragraph.decompose()
+        self._log('Preprocessed article HTML; text chars=%d; images=%d' % (
+            len(soup.get_text(' ', strip=True)), len(soup.find_all('img'))))
+        return soup
+
+    def postprocess_book(self, oeb, opts, log):
+        self._log('Post-processing EPUB. Manifest items=%d' % len(oeb.manifest))
+        return oeb
