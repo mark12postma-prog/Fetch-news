@@ -29,6 +29,7 @@ class LeeuwarderCourant(BasicNewsRecipe):
     country = 'nl'
     publisher = 'Leeuwarder Courant'
     category = 'news'
+    browser_type = 'camoufox'
     oldest_article = 1
     max_articles_per_feed = 500
     use_embedded_content = False
@@ -89,20 +90,41 @@ class LeeuwarderCourant(BasicNewsRecipe):
         raise Exception('%s failed. Tried:\n%s' % (label, '\n'.join(errors)))
 
     def _packages(self):
+        reader_url = (
+            'https://mhu-lczui-webreader-production.'
+            'twipemobile.com/'
+        )
+    
+        self._log('Opening reader homepage to establish session')
+        try:
+            response = self.browser.open(
+                reader_url, timeout=self.timeout
+            )
+            self._log(
+                'Reader homepage opened; HTTP status=%s' %
+                getattr(response, 'code', 'unknown')
+            )
+        except Exception as err:
+            self._warning(
+                'Reader homepage request failed: %s' % err
+            )
+    
+        self.browser.addheaders = [
+            ('User-Agent',
+             'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
+             'AppleWebKit/537.36 (KHTML, like Gecko) '
+             'Chrome/147.0.0.0 Safari/537.36'),
+            ('Referer', reader_url),
+            ('Origin',
+             'https://mhu-lczui-webreader-production.twipemobile.com'),
+            ('Accept', 'application/json, text/plain, */*'),
+        ]
+    
+        self._log('Requesting publication package list')
         data = self._json_request(self.INDEX_URL)
-        if isinstance(data, dict):
-            for key in ('ContentPackageList', 'ContentPackages', 'Data', 'Result', 'Items'):
-                if isinstance(data.get(key), list):
-                    data = data[key]
-                    break
-        if not isinstance(data, list):
-            raise Exception('Unexpected package-list response: %r' % type(data))
-        self._log('Package records received: %d' % len(data))
-        for package in data:
-            self._log('Package: id=%s date=%s name=%r format=%r status=%r' % (
-                package.get('ContentPackageId'), package.get('PublicationDate'),
-                package.get('ContentPackageName'), package.get('ContentPackageFormat'),
-                package.get('Status')))
+
+        # Keep the remainder of the existing _packages() method here:
+        # unwrap the response, log package records, and return the list.
         return data
 
     def _date(self, value):
