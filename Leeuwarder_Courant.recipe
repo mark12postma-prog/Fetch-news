@@ -1,0 +1,452 @@
+#!/usr/bin/env python
+# vim:fileencoding=utf-8
+__license__ = 'GPL v3'
+__copyright__ = '2026'
+'''
+Leeuwarder Courant (LC) - print edition via the Twipe webreader API (no login needed).
+
+Flow (mirrors what the webreader does):
+  1. OpenSession (anonymous)                       -> UserId + SessionId
+  2. getcontentpackagelist                         -> newest edition (latest PublicationDate)
+  3. RequestDownload + Confirm_Download            -> DownloadId
+  4. GetContentPackagePublications-<pkg>-V3.json   -> PublicationID of the main paper
+  5. GetDownloadCredentials                        -> signed CloudFront URL patterns (valid ~30 min)
+  6. GetPublicationContentItems / GetPublicationPages json from the CDN
+       -> all articles (title, intro, formatted body, captions, authors, images, page numbers)
+       -> page codes (VPG, IHN, ECO, SPO, REG, CUL ...) = the sections of the paper
+  7. every article is rendered to clean HTML locally (articles_are_obfuscated); photos are
+     downloaded, scaled for the Kobo Libra Colour and re-compressed.
+'''
+
+import json
+import re
+import time
+import uuid
+from collections import Counter, OrderedDict, defaultdict
+from html import escape
+from io import BytesIO
+
+from calibre.ptempfile import PersistentTemporaryFile
+from calibre.web.feeds.news import BasicNewsRecipe
+
+try:
+    from calibre.ebooks.BeautifulSoup import BeautifulSoup
+except Exception:  # only for running the converter outside calibre (tests)
+    from bs4 import BeautifulSoup
+
+# ============================== CONFIG ==============================
+API_BASE = 'https://mhu-lczui-api.prod.twipecloud.net'
+READER_BASE = 'https://mhu-lczui-webreader-production.twipemobile.com'
+TITLE_TOKEN = 'MHULCZUILC'
+API_KEY = 'mhu-lczui-tenant-identifier'
+APP_USER_ID = 10321462          # the id in the OpenSession url of the webreader
+
+KEEP_PULLQUOTES = False         # pull quotes repeat text that is already in the article
+MIN_TEXT_CHARS = 0              # skip very short snippets (e.g. 40 to drop one-liners)
+
+# Image pattern is Image-<SIZE>-<ID>.jpg. The HAR contains no article-image request, so the
+# recipe probes these sizes (and ContentItemId / image reference as id) once and uses the first hit.
+IMAGE_SIZES = ['XLARGE', 'LARGE', 'MEDIUM', 'ORIGINAL', 'SMALL']
+
+# Page code (part of ExternalPageReference of every page) -> section name
+SECTION_NAMES = {
+    'VPG': 'Voorpagina', 'IHN': 'Nieuws', 'ECO': 'Economie', 'SPR': 'Sport', 'SPO': 'Sport',
+    'POD': 'Opinie', 'STR': 'Streek', 'REG': 'Regio', 'CUL': 'Cultuur', 'RTV': 'Radio & TV',
+    'UIT': 'Uit', 'SRV': 'Service', 'LCZGA': 'Advertenties', 'LCZFAMT': 'Familieberichten',
+}
+
+# Kobo Libra Colour (1264x1680): scale to the screen first, then extra compression
+SCREEN_W, SCREEN_H = 1264, 1680
+IMAGE_EXTRA_SCALE = 1.0         # extra shrink factor after fitting to the screen (e.g. 0.8)
+IMAGE_JPEG_QUALITY = 55
+# ====================================================================
+
+ALLOWED_TAGS = {'p', 'b', 'i', 'a', 'h4', 'div', 'span', 'table', 'tbody', 'tr', 'td',
+                'blockquote', 'br', 'sup', 'sub'}
+FLAGS = re.I | re.S
+
+
+def clean_ws(s):
+    return re.sub(r'\s+', ' ', s or '').strip()
+
+
+def strip_tags(s):
+    return clean_ws(re.sub(r'<[^>]+>', ' ', s or ''))
+
+
+def _dateline(m):
+    inner = clean_ws(m.group(1))
+    return '<b>%s</b>' % inner if inner else ''
+
+
+def _subhead(m):
+    inner = strip_tags(m.group(1))
+    return '<h4>%s</h4>' % inner if inner else ''
+
+
+def _weblink(m):
+    href = re.search(r'href="([^"]*)"', m.group(1))
+    return '<a href="%s">%s</a>' % (href.group(1), m.group(2)) if href else m.group(2)
+
+
+def _anchor(m):
+    href = re.search(r'href="([^"]*)"', m.group(1))
+    return '<a href="%s">' % href.group(1) if href else '<a>'
+
+
+def tidy_fragment(raw, keep_pullquotes=False):
+    '''Twipe/InDesign-ish XML-in-HTML  ->  list of clean top-level HTML blocks.'''
+    s = raw or ''
+    # layout-only markers
+    s = re.sub(r'<(?:extra_leading|spell_frysk|inspringen_start|inspringen_eind|drop_initial__\d+)\b[^>]*>', '', s, flags=FLAGS)
+    s = re.sub(r'<z_tb_header\b[^>]*>.*?</z_tb_header>', '', s, flags=FLAGS)
+    s = re.sub(r'<Zie_verder\b[^>]*>.*?</Zie_verder>', '', s, flags=FLAGS)   # "Pagina 2: ..." / mail address
+    s = re.sub(r'</?col\b[^>]*>', '', s, flags=FLAGS)
+    if keep_pullquotes:
+        s = re.sub(r'<quote\b[^>]*>\s*<text\b[^>]*>(.*?)</text>\s*</quote>',
+                   r'<blockquote><p>\1</p></blockquote>', s, flags=FLAGS)
+    else:
+        s = re.sub(r'<quote\b[^>]*>.*?</quote>', '', s, flags=FLAGS)
+    s = re.sub(r'</?TypographyTag\b[^>]*>', '', s, flags=FLAGS)
+    # semantic tags
+    s = re.sub(r'<(/?)italic\b[^>]*>', r'<\1i>', s, flags=FLAGS)
+    s = re.sub(r'<(/?)bold\b[^>]*>', r'<\1b>', s, flags=FLAGS)
+    s = re.sub(r'<cutline_credit\b[^>]*>(.*?)</cutline_credit>', r'<span class="credit">\1</span>', s, flags=FLAGS)
+    s = re.sub(r'<dateline\b[^>]*>(.*?)</dateline>', _dateline, s, flags=FLAGS)
+    s = re.sub(r'<naam\b[^>]*>(.*?)</naam>', r'<span class="byline">\1</span>', s, flags=FLAGS)
+    s = re.sub(r'<subhead\b[^>]*>(.*?)</subhead>', _subhead, s, flags=FLAGS)
+    s = re.sub(r'<howto\b[^>]*>', '<div class="infoblok">', s, flags=FLAGS)
+    s = re.sub(r'</howto>', '</div>', s, flags=FLAGS)
+    s = re.sub(r'<web\b([^>]*)>(.*?)</web>', _weblink, s, flags=FLAGS)
+    s = re.sub(r'<a\b([^>]*)>', _anchor, s, flags=FLAGS)
+    s = re.sub(r'<table\b[^>]*>', '<table class="score">', s, flags=FLAGS)
+    for t in ('tbody', 'tr', 'td'):
+        s = re.sub(r'<%s\b[^>]*>' % t, '<%s>' % t, s, flags=FLAGS)
+
+    soup = BeautifulSoup('<div id="r">%s</div>' % s, 'html.parser')
+    root = soup.find(id='r')
+    for tag in root.find_all(True):
+        if tag.name not in ALLOWED_TAGS:
+            tag.unwrap()          # unknown custom tags: keep text, drop tag
+            continue
+        keep = {}
+        if tag.name == 'a' and tag.get('href'):
+            keep['href'] = tag['href']
+        if tag.get('class'):
+            keep['class'] = tag['class']
+        tag.attrs = keep
+    for tag in reversed(root.find_all(['p', 'b', 'i', 'span', 'h4', 'div'])):
+        if not tag.get_text(strip=True):
+            tag.decompose()
+    return [str(c) for c in root.contents if str(c).strip()]
+
+
+def nice_author(name):
+    name = clean_ws(name)
+    if name and (name == name.lower() or name == name.upper()):
+        name = name.title()
+    return name
+
+
+def section_from_url(url):
+    m = re.match(r'https?://[^/]+/([^/?#]+)', url or '')
+    if not m:
+        return None
+    seg = m.group(1)
+    if seg.isdigit() or seg.endswith('.html'):
+        return None
+    return seg.replace('-', ' ').capitalize()
+
+
+def extract_articles(data):
+    '''GetPublicationContentItems json -> list of plain dicts.'''
+    out = []
+    for order, c in enumerate(data.get('Content') or []):
+        items = sorted(c.get('ContentItem') or [], key=lambda i: i.get('ContentItemPosition') or 0)
+        texts = [i for i in items if (i.get('ContentType') or '').startswith('text/')]
+        if not texts:
+            continue
+        title = clean_ws(' '.join(t.get('Title') or '' for t in texts))
+        intro = '\n'.join(t.get('Introduction') or '' for t in texts)
+        body = '\n'.join(t.get('HtmlText') or '' for t in texts)
+        subtitle = clean_ws(' '.join(t.get('SubTitle') or '' for t in texts))
+        kicker = clean_ws(' '.join(t.get('SupTitle') or '' for t in texts))
+        if '@' in subtitle:     # print footer such as "tips@lc.nl"
+            subtitle = ''
+        if len(strip_tags(intro + body)) <= MIN_TEXT_CHARS or not strip_tags(intro + body):
+            continue
+        authors = []
+        for i in items:
+            if (i.get('ContentType') or '').startswith('author') and i.get('Author'):
+                a = nice_author(i['Author'])
+                if a and a not in authors:
+                    authors.append(a)
+        images = [{'ref': i.get('ExternalContentItemReference'), 'id': i.get('ContentItemId'),
+                   'ctype': i.get('ContentType') or 'image/jpeg', 'caption': strip_tags(i.get('HtmlText'))}
+                  for i in items if (i.get('ContentType') or '').startswith('image')]
+        weburl = ''
+        for i in items:
+            if (i.get('ContentType') or '').startswith('metadata') and \
+                    str(i.get('ExternalContentItemReference') or '').startswith('http'):
+                weburl = i['ExternalContentItemReference']
+        out.append({'cid': c.get('ContentID'), 'order': order, 'page': c.get('PageNumber') or 0,
+                    'title': (title[:1].upper() + title[1:]) if title else 'Zonder titel',
+                    'subtitle': subtitle, 'kicker': kicker, 'intro': intro, 'body': body,
+                    'authors': authors, 'images': images, 'weburl': weburl})
+    return out
+
+
+def page_codes(pages_json):
+    '''GetPublicationPages json -> {page number: section code}, e.g. {1: 'VPG', 2: 'IHN', 21: 'REG'}'''
+    out = {}
+    for p in (pages_json or {}).get('Page') or []:
+        m = re.search(r'_([A-Z]{2,})\d+_', p.get('ExternalPageReference') or '')
+        if m:
+            out[p.get('PageNumber')] = m.group(1)
+    return out
+
+
+def group_sections(arts, codes=None):
+    '''Section = page code of the printed page (VPG/IHN/ECO/SPO/REG/CUL ...). Without page info
+    fall back on the first path segment of the lc.nl link, otherwise "Overig".'''
+    codes = codes or {}
+    for a in arts:
+        code = codes.get(a['page'])
+        if code:
+            a['section'] = SECTION_NAMES.get(code, code.title())
+        else:
+            a['section'] = section_from_url(a['weburl']) or 'Overig'
+    secs = OrderedDict()
+    first_page = {}
+    for a in sorted(arts, key=lambda a: (a['page'], a['order'])):
+        secs.setdefault(a['section'], []).append(a)
+        first_page.setdefault(a['section'], a['page'])
+    return OrderedDict(sorted(secs.items(), key=lambda kv: first_page[kv[0]]))
+
+
+def spread_images(blocks, figures):
+    out = list(blocks)
+    n, k = len(out), len(figures)
+    if not k:
+        return out
+    pos = [max(0, min(n, int(round((j + 1) * n / (k + 1))))) for j in range(k)]
+    for p, fig in sorted(zip(pos, figures), key=lambda x: x[0], reverse=True):
+        out.insert(p, fig)
+    return out
+
+
+def build_article_html(art, image_url=None, keep_pullquotes=False):
+    '''image_url: callable(image dict) -> url, or None for a text-only article.'''
+    figs = []
+    if image_url:
+        for im in art['images']:
+            url = image_url(im)
+            if not url:
+                continue
+            f = '<div class="photo"><img src="%s"/>' % escape(url, quote=True)
+            if im['caption']:
+                f += '<p class="caption">%s</p>' % escape(im['caption'])
+            figs.append(f + '</div>')
+    parts = ['<html><head><meta charset="utf-8"/><title>%s</title></head><body>' % escape(art['title'])]
+    if art['kicker']:
+        parts.append('<p class="kicker">%s</p>' % escape(art['kicker']))
+    parts.append('<h1>%s</h1>' % escape(art['title']))
+    if art['subtitle']:
+        parts.append('<h3 class="sub">%s</h3>' % escape(art['subtitle']))
+    if art['authors']:
+        parts.append('<p class="byline">%s</p>' % escape(', '.join(art['authors'])))
+    intro = tidy_fragment(art['intro'], keep_pullquotes)
+    if intro:
+        parts.append('<div class="intro">%s</div>' % ''.join(intro))
+    body = tidy_fragment(art['body'], keep_pullquotes)
+    if figs:
+        parts.append(figs[0])
+    parts.extend(spread_images(body, figs[1:]))
+    parts.append('</body></html>')
+    return '\n'.join(parts)
+
+
+def find_key(obj, names):
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            if k in names and v:
+                return v
+        for v in obj.values():
+            r = find_key(v, names)
+            if r:
+                return r
+    elif isinstance(obj, list):
+        for v in obj:
+            r = find_key(v, names)
+            if r:
+                return r
+    return None
+
+
+def latest_package(pkgs):
+    ok = [p for p in pkgs if (p.get('Status') or 'OK') == 'OK'] or pkgs
+    return max(ok, key=lambda p: (p.get('PublicationDate') or '', p.get('ContentPackageId') or 0))
+
+
+class LeeuwarderCourant(BasicNewsRecipe):
+    title = 'Leeuwarder Courant'
+    __author__ = 'LC / Twipe webreader'
+    description = 'Leeuwarder Courant - complete krant van vandaag (Twipe webreader)'
+    language = 'nl'
+    publication_type = 'newspaper'
+    encoding = 'utf-8'
+
+    articles_are_obfuscated = True
+    no_stylesheets = True
+    remove_javascript = True
+    auto_cleanup = False
+    use_embedded_content = False
+    # we scale/compress ourselves in preprocess_image
+    compress_news_images = False
+    scale_news_images_to_device = False
+    timeout = 60
+
+    extra_css = '''
+        h1 { font-size: 1.4em; margin: 0 0 0.3em 0; }
+        h3.sub { font-size: 1.05em; font-weight: normal; font-style: italic; margin: 0 0 0.4em 0; }
+        h4 { font-size: 1.05em; margin: 1.1em 0 0.2em 0; }
+        p.kicker { font-size: 0.8em; text-transform: uppercase; margin: 0 0 0.2em 0; }
+        p.byline, span.byline { font-style: italic; font-size: 0.9em; }
+        p.byline { margin: 0 0 0.8em 0; }
+        div.intro { font-weight: bold; margin: 0.3em 0 0.9em 0; }
+        div.photo { margin: 0.8em 0; text-align: center; }
+        div.photo img { max-width: 100%; height: auto; }
+        p.caption { font-size: 0.8em; font-style: italic; text-align: left; margin: 0.2em 0 0 0; }
+        div.infoblok { border-top: 1px solid; border-bottom: 1px solid; padding: 0.4em 0; margin: 1em 0; font-size: 0.9em; }
+        blockquote { font-style: italic; margin: 0.8em 1.5em; }
+        table.score { margin: 0.8em 0; border-collapse: collapse; }
+        table.score td { padding: 0.1em 0.8em 0.1em 0; }
+        span.credit { font-size: 0.8em; font-style: italic; }
+    '''
+
+    # ------------------------------------------------------------------
+    def _api(self, url, payload=None):
+        br = self.get_browser()
+        br.addheaders += [('x-api-key', API_KEY), ('Accept', 'application/json'),
+                          ('Origin', READER_BASE), ('Referer', READER_BASE + '/')]
+        data = None
+        if payload is not None:
+            br.addheaders += [('Content-Type', 'application/json')]
+            data = json.dumps(payload).encode('utf-8')
+        raw = br.open_novisit(url, data=data, timeout=self.timeout).read()
+        return json.loads(raw.decode('utf-8-sig')) if raw.strip() else {}
+
+    def _pick_image_format(self, creds, arts):
+        '''Probe Image-<SIZE>-<ID> once with a real photo; returns a callable image dict -> url.'''
+        sample = next((im for a in arts for im in a['images'] if im['id']), None)
+        if not sample:
+            return None
+
+        def make(size, kind):
+            def url_for(im):
+                pat = creds.get('ImagePngPattern') if 'png' in im['ctype'] and creds.get('ImagePngPattern') \
+                    else creds.get('ImagePattern')
+                ident = im['id'] if kind == 'id' else im['ref']
+                if not pat or not ident:
+                    return None
+                return pat.replace('%SIZENAME%', size).replace('%IMAGE_ID%', str(ident))
+            return url_for
+
+        br = self.get_browser()
+        for size in IMAGE_SIZES:
+            for kind in ('id', 'ref'):
+                fn = make(size, kind)
+                try:
+                    head = br.open_novisit(fn(sample), timeout=30).read(512)
+                except Exception:
+                    continue
+                if head[:2] == b'\xff\xd8' or head[:4] == b'\x89PNG':
+                    self.log('Images: Image-%s-<%s>' % (size, kind))
+                    return fn
+        self.log.warn('No working image url found; building a text-only paper')
+        return None
+
+    def parse_index(self):
+        sess = self._api('%s/Session/SessionService.svc/json/OpenSession/webApp/%s/%s/1.0.0/1.0.0' % (
+            API_BASE, APP_USER_ID, uuid.uuid4()))['SessionInfo']
+        user_id, session_id = sess['UserId'], sess['SessionId']
+
+        pkgs = self._api('%s/Data/DataService.svc/getcontentpackagelist/%s/0/30' % (API_BASE, TITLE_TOKEN))
+        if isinstance(pkgs, dict):
+            pkgs = next((v for v in pkgs.values() if isinstance(v, list)), [])
+        pkg = latest_package(pkgs)
+        pkg_id = pkg['ContentPackageId']
+        date = (pkg.get('PublicationDate') or '')[:10]
+        self.log('Edition %s (%s), package %s' % (date, pkg.get('ContentPackageFormat'), pkg_id))
+
+        dl = self._api('%s/Session/SessionService.svc/json/RequestDownload/%s/%s/0/%s/0/unknown' % (
+            API_BASE, user_id, session_id, pkg_id))
+        dl_id = dl['DownloadID']
+        try:
+            self._api(API_BASE + '/Session/SessionService.svc/json/Confirm_Download', {
+                'UserId': user_id, 'SessionId': session_id, 'Version': '3.45.6',
+                'DownloadPublicationStatusHistory': {
+                    'PublicationId': pkg_id, 'PublicationQuality': 'Full',
+                    'RequestedPublicationTitleFormat': 'Newspaper', 'StatusInfo': '',
+                    'StatusTime': time.strftime('%Y-%m-%dT%H:%M:%S+0000', time.gmtime())},
+                'DownloadId': dl_id, 'Device': 'WebApp', 'DownloadStatus': 'Requested'})
+        except Exception as err:
+            self.log.warn('Confirm_Download failed (ignored): %s' % err)
+
+        pubs = self._api('%s/data/%s/data/GetContentPackagePublications-%s-V3.json?t=%d' % (
+            READER_BASE, pkg_id, pkg_id, int(time.time() * 1000)))['ContentPackagePublication']
+        pub = next((p for p in pubs if p.get('PublicationType') == 'Main'), pubs[0])
+        pub_id = pub['PublicationID']
+
+        creds = self._api('%s/GetDownloadCredentials/%s/%s/%s' % (API_BASE, user_id, session_id, dl_id))
+        json_url = lambda name: creds['JsonPattern'].replace('%JSON_NAME%', name)  # noqa
+        data = self._api(json_url('GetPublicationContentItems-%s' % pub_id))
+        try:
+            codes = page_codes(self._api(json_url('GetPublicationPages-%s' % pub_id)))
+        except Exception as err:
+            self.log.warn('No page list, sections from links only: %s' % err)
+            codes = {}
+
+        arts = extract_articles(data)
+        if not arts:
+            self.abort_recipe_processing('No articles found in the edition.')
+        self.log('%d articles on %d pages' % (len(arts), len(codes)))
+        self._image_url = self._pick_image_format(creds, arts)
+        if pkg.get('ThumbnailId'):
+            self.cover_url = '%s/data/%s/covers/Preview-MEDIUM-%s.jpg' % (READER_BASE, pkg_id, pkg['ThumbnailId'])
+
+        self._pages = {}
+        index = []
+        for sec, items in group_sections(arts, codes).items():
+            feed = []
+            for a in items:
+                url = 'https://www.lc.nl/epaper/%s' % a['cid']
+                self._pages[url] = a
+                desc = 'Pagina %s' % a['page']
+                if a['authors']:
+                    desc += ' - ' + ', '.join(a['authors'])
+                feed.append({'title': a['title'], 'url': url, 'description': desc, 'date': date})
+            index.append((sec, feed))
+        return index
+
+    def get_obfuscated_article(self, url):
+        html = build_article_html(self._pages[url], self._image_url, KEEP_PULLQUOTES)
+        pt = PersistentTemporaryFile('_lc.html')
+        pt.write(html.encode('utf-8'))
+        pt.close()
+        return pt.name
+
+    def preprocess_image(self, img_data, image_url):
+        try:
+            from PIL import Image
+            im = Image.open(BytesIO(img_data))
+            im = im.convert('RGB')
+            w, h = im.size
+            f = min(1.0, SCREEN_W / float(w), SCREEN_H / float(h)) * IMAGE_EXTRA_SCALE
+            if f < 1.0:
+                im = im.resize((max(1, int(w * f)), max(1, int(h * f))), Image.LANCZOS)
+            buf = BytesIO()
+            im.save(buf, 'JPEG', quality=IMAGE_JPEG_QUALITY, optimize=True)
+            return buf.getvalue()
+        except Exception:
+            return img_data
