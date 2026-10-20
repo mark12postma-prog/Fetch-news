@@ -306,6 +306,15 @@ class LeeuwarderCourant(BasicNewsRecipe):
     scale_news_images_to_device = False
     timeout = 60
 
+    # Book metadata, written into the finished EPUB. The index is the issue date as YYYYMMDD
+    # so the issues sort chronologically; get_cover_url() replaces today's date with the
+    # date of the issue itself (there is no Sunday paper). Change series_name to taste.
+    series_name = 'Leeuwarder Courant'
+    conversion_options = {
+        'series': series_name,
+        'series_index': float(datetime.date.today().strftime('%Y%m%d')),
+    }
+
     extra_css = '''
         h1 { font-size: 1.4em; margin: 0 0 0.3em 0; }
         h3.sub { font-size: 1.05em; font-weight: normal; font-style: italic; margin: 0 0 0.4em 0; }
