@@ -59,6 +59,8 @@ SECTION_NAMES = {
 SCREEN_W, SCREEN_H = 1264, 1680
 IMAGE_EXTRA_SCALE = 1.0         # extra shrink factor after fitting to the screen (e.g. 0.8)
 IMAGE_JPEG_QUALITY = 55
+IMAGE_COLOR_BOOST = 1.15        # PIL ImageEnhance.Color factor (1.0 = unchanged)
+IMAGE_CONTRAST_BOOST = 1.05     # PIL ImageEnhance.Contrast factor (1.0 = unchanged)
 # ====================================================================
 
 ALLOWED_TAGS = {'p', 'b', 'i', 'a', 'h4', 'div', 'span', 'table', 'tbody', 'tr', 'td',
@@ -315,6 +317,7 @@ class LeeuwarderCourant(BasicNewsRecipe):
         'series_index': float(datetime.date.today().strftime('%Y%m%d')),
     }
 
+
     extra_css = '''
         h1 { font-size: 1.4em; margin: 0 0 0.3em 0; }
         h3.sub { font-size: 1.05em; font-weight: normal; font-style: italic; margin: 0 0 0.4em 0; }
@@ -447,13 +450,19 @@ class LeeuwarderCourant(BasicNewsRecipe):
 
     def preprocess_image(self, img_data, image_url):
         try:
-            from PIL import Image
+            from PIL import Image, ImageEnhance
             im = Image.open(BytesIO(img_data))
             im = im.convert('RGB')
             w, h = im.size
             f = min(1.0, SCREEN_W / float(w), SCREEN_H / float(h)) * IMAGE_EXTRA_SCALE
             if f < 1.0:
                 im = im.resize((max(1, int(w * f)), max(1, int(h * f))), Image.LANCZOS)
+            # colour/contrast boost for the e-ink colour screen (after resizing = cheaper)
+            if im.mode == 'RGB':
+                if IMAGE_COLOR_BOOST != 1.0:
+                    im = ImageEnhance.Color(im).enhance(IMAGE_COLOR_BOOST)
+                if IMAGE_CONTRAST_BOOST != 1.0:
+                    im = ImageEnhance.Contrast(im).enhance(IMAGE_CONTRAST_BOOST)
             buf = BytesIO()
             im.save(buf, 'JPEG', quality=IMAGE_JPEG_QUALITY, optimize=True)
             return buf.getvalue()
