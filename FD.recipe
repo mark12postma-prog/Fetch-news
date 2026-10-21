@@ -1,0 +1,452 @@
+#!/usr/bin/env python
+# vim:fileencoding=utf-8
+"""
+Het Financieele Dagblad - digitale krant (fd.nl/krant)
+
+How it works (same idea as the NRC-edit recipe):
+  1. Load https://fd.nl/krant (or /krant/YYYY/M/D for an older edition).
+     That page shows every printed page as an image with clickable
+     regions linking to /HFD_<yyyymmdd>_<publication>_<page>_<article>.
+     Extra publications (e.g. a Saturday supplement) are listed as
+     ?publication=N links and are fetched as well.
+  2. Every article is opened once while building the index, to read its
+     title, section (rubriek), intro and author. The HTML is cached and
+     handed back to calibre through get_obfuscated_article(), so nothing
+     is downloaded twice.
+  3. Articles are grouped per section, in the order of the printed paper.
+     Page 1 is grouped as "Voorpagina".
+
+Logging in (optional)
+  Not needed: the index is public and, like NRC, the article text is in
+  the page underneath FD's upsell overlay, which the recipe strips
+  (.modal.upsell, .article-upsell). The log warns if articles come back
+  with (almost) no body text; only then supply a session cookie in one
+  of these ways:
+    - environment variable FD_COOKIE  (recommended for GitHub Actions:
+      FD_COOKIE: ${{ secrets.FD_COOKIE }} ; it is never written to the log)
+    - environment variable FD_COOKIE_FILE = path to a text file with it
+    - or paste it into FD_COOKIE below (handy for the calibre GUI)
+  The value is the "cookie:" request header of any fd.nl page while
+  logged in (DevTools > Network > click the fd.nl document > Request
+  Headers > cookie), i.e. "name1=value1; name2=value2; ...".
+
+Recipe-specific options (ebook-convert FD.recipe out.epub
+  --recipe-specific-option date:2026-10-20):
+    date        edition date YYYY-MM-DD (default: today's paper)
+"""
+
+import json
+import os
+import re
+from urllib.parse import urljoin, urlparse
+
+from calibre.web.feeds.news import BasicNewsRecipe
+
+# Paste the cookie header here if you don't use the FD_COOKIE env variable.
+FD_COOKIE = ''
+
+BASE = 'https://fd.nl'
+ARTICLE_ID_RE = re.compile(r'^/?(HFD_(\d{8})_(\d+)_(\d{3})_(\d{3}))$')
+
+# Fallback section names derived from the article URL path.
+URL_SECTIONS = {
+    'ondernemen': 'Ondernemen',
+    'economie': 'Economie',
+    'politiek': 'Politiek',
+    'financiele-markten': 'Financiële markten',
+    'beurs': 'Beurs',
+    'opinie': 'Opinie',
+    'tech-en-innovatie': 'Tech & Innovatie',
+    'samenleving': 'Samenleving',
+    'achtergrond': 'Achtergrond',
+    'persoonlijk': 'FD Persoonlijk',
+    'cultuur': 'Cultuur',
+    'werk': 'Werk',
+    'morgen': 'Morgen',
+}
+
+# Kobo Libra Colour screen
+SCREEN_W, SCREEN_H = 1264, 1680
+# JPEG quality after scaling to the screen; lower = smaller file.
+JPEG_QUALITY = 60
+
+
+class FDKrant(BasicNewsRecipe):
+    title = 'Het Financieele Dagblad'
+    __author__ = 'Mark Postma'
+    description = 'De digitale krant van Het Financieele Dagblad (fd.nl/krant), per rubriek in krantvolgorde.'
+    publisher = 'FD Mediagroep'
+    language = 'nl'
+    country = 'NL'
+    category = 'news, economie, financiën, Netherlands'
+    encoding = 'utf-8'
+    timefmt = ' [%a %d %b %Y]'
+
+    no_stylesheets = True
+    remove_javascript = True
+    use_embedded_content = False
+    ignore_duplicate_articles = {'url'}
+    max_articles_per_feed = 200
+    oldest_article = 2
+    delay = 0.3
+    simultaneous_downloads = 4
+    touchscreen = True
+    resolve_internal_links = True
+
+    articles_are_obfuscated = True   # serve cached HTML from parse_index
+
+    # Images: scaled + recompressed in preprocess_image below
+    compress_news_images = False
+    scale_news_images = None
+
+    recipe_specific_options = {
+        'date': {
+            'short': 'Datum van de editie (YYYY-MM-DD)',
+            'long': 'Leeg laten voor de krant van vandaag.',
+        },
+    }
+
+    remove_tags = [
+        dict(name=['script', 'noscript', 'style', 'iframe', 'form', 'button', 'svg']),
+        dict(attrs={'class': lambda c: c and any(x in c.split() for x in (
+            'article-upsell', 'upsell', 'modal', 'ad', 'socialFree',
+            'digikrant-back-link', 'article-aside-content',
+            'fd-related-articles', 'fd-article-topics', 'topics-container-wide',
+            'fd-read-more', 'related-link', 'related-pdf', 'dossier',
+            'share-button', 'share-social', 'fallback-share', 'native-share',
+            'fd-newsletter-subscription-card', 'blocked-content-container',
+            'zoom-in', 'zoom-out', 'images', 'notification', 'order-footer',
+            'fd-follow-button', 'fd-interest-button',
+        ))}),
+        dict(name='footer'),
+    ]
+    remove_attributes = ['style', 'width', 'height', 'srcset', 'sizes', 'loading', 'data-src']
+
+    extra_css = '''
+        h1 { font-size: 1.5em; font-weight: bold; margin: 0.3em 0; }
+        h2, h3 { font-size: 1.15em; font-weight: bold; margin-top: 1em; }
+        .fd-section { font-size: 0.8em; text-transform: uppercase; letter-spacing: 0.05em; color: #555; }
+        .intro { font-weight: bold; margin: 0.6em 0 1em 0; }
+        .authors, .fd-byline { font-size: 0.85em; font-style: italic; color: #444; }
+        figure { margin: 1em 0; }
+        figure img, img { max-width: 100%; height: auto; display: block; margin: 0 auto; }
+        figcaption { font-size: 0.8em; color: #444; margin-top: 0.3em; }
+        blockquote { font-style: italic; margin: 1em 1.5em; }
+    '''
+
+    # ------------------------------------------------------------------
+    # Browser / login
+    # ------------------------------------------------------------------
+    def _cookie_header(self):
+        val = os.environ.get('FD_COOKIE') or ''
+        path = os.environ.get('FD_COOKIE_FILE')
+        if not val and path and os.path.exists(path):
+            with open(path, encoding='utf-8') as f:
+                val = f.read()
+        val = (val or FD_COOKIE).strip()
+        if val.lower().startswith('cookie:'):
+            val = val[7:]
+        return val.strip()
+
+    def get_browser(self, *a, **kw):
+        br = BasicNewsRecipe.get_browser(self, *a, **kw)
+        cookie = self._cookie_header()
+        n = 0
+        for part in cookie.split(';'):
+            name, sep, value = part.strip().partition('=')
+            if sep and name:
+                br.set_cookie(name.strip(), value.strip(), '.fd.nl')
+                n += 1
+        if n:
+            self.log('FD: %d cookie(s) gezet' % n)
+        br.addheaders += [('Accept-Language', 'nl-NL,nl;q=0.9,en;q=0.8')]
+        return br
+
+    # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
+    def _open(self, url, br=None):
+        br = br or self.browser
+        res = br.open_novisit(url, timeout=self.timeout)
+        raw = res.read()
+        final = res.geturl() if hasattr(res, 'geturl') else url
+        return raw.decode('utf-8', 'replace'), final
+
+    def _edition_url(self):
+        d = (self.recipe_specific_options or {}).get('date')
+        if d and d.strip() and d.strip().lower() not in ('current', 'today', 'vandaag'):
+            y, m, dd = (int(x) for x in d.strip().split('-'))
+            self.timefmt = ' [%04d-%02d-%02d]' % (y, m, dd)
+            return '%s/krant/%d/%d/%d' % (BASE, y, m, dd)
+        return BASE + '/krant'
+
+    @staticmethod
+    def _text(tag):
+        return re.sub(r'\s+', ' ', tag.get_text(' ', strip=True)).strip() if tag else ''
+
+    def _parse_edition_page(self, soup):
+        """Return (cover_url, [(article_id, page_no)], [publication query strings])."""
+        cover = None
+        first = soup.find('section', id=re.compile(r'^page-\d+$'))
+        if first:
+            d = first.find('div', attrs={'data-lowsrc': True}) or first.find('div', attrs={'data-src': True})
+            if d:
+                cover = d.get('data-lowsrc') or d.get('data-src')
+        items = []
+        for sec in soup.findAll('section', id=re.compile(r'^page-\d+$')):
+            page_no = int(sec['id'].split('-')[1])
+            for a in sec.findAll('a', href=True):
+                m = ARTICLE_ID_RE.match(a['href'].strip())
+                if m:
+                    items.append((m.group(1), page_no))
+        pubs = []
+        for a in soup.findAll('a', href=re.compile(r'^\?publication=\d+$')):
+            if a['href'] not in pubs:
+                pubs.append(a['href'])
+        return cover, items, pubs
+
+    def _json_ld(self, soup):
+        out = {}
+        for s in soup.findAll('script', attrs={'type': 'application/ld+json'}):
+            try:
+                data = json.loads(s.string or s.get_text() or '{}')
+            except Exception:
+                continue
+            for d in (data if isinstance(data, list) else data.get('@graph', [data])):
+                if isinstance(d, dict) and ('headline' in d or 'articleSection' in d):
+                    out.update(d)
+        return out
+
+    def _meta(self, soup, *names):
+        for n in names:
+            t = soup.find('meta', attrs={'property': n}) or soup.find('meta', attrs={'name': n})
+            if t and t.get('content'):
+                return t['content'].strip()
+        return ''
+
+    def _article_info(self, soup, url):
+        ld = self._json_ld(soup)
+        content = soup.find(attrs={'class': 'article-content'}) or soup
+
+        title = ld.get('headline') or ''
+        if not title:
+            h1 = content.find('h1')
+            title = self._text(h1)
+        if not title:
+            title = re.sub(r'\s*\|\s*Het Financieele Dagblad\s*$', '', self._meta(soup, 'og:title'))
+
+        section = ld.get('articleSection') or ''
+        if isinstance(section, list):
+            section = section[0] if section else ''
+        if not section:
+            section = self._meta(soup, 'article:section')
+        if not section:
+            hdr = content.find('header')
+            t = hdr.find(attrs={'class': lambda c: c and ('title' in c.split() or 'title-persoonlijk' in c.split())}) if hdr else None
+            section = self._text(t)
+        if not section:
+            seg = urlparse(url).path.strip('/').split('/')[0]
+            section = URL_SECTIONS.get(seg, '')
+
+        intro = self._text(content.find(attrs={'class': 'intro'})) or self._meta(soup, 'og:description', 'description')
+
+        author = ''
+        au = ld.get('author')
+        if au:
+            au = au if isinstance(au, list) else [au]
+            author = ', '.join(x.get('name', '') if isinstance(x, dict) else str(x) for x in au).strip(', ')
+        if not author:
+            names = content.find(attrs={'class': 'names'})
+            author = self._text(names)
+
+        # Paywall check on the actual text, not on the no-access flag: the
+        # upsell is an overlay and the text is normally still in the page.
+        body = content.find(attrs={'class': 'body'})
+        body_len = len(self._text(body)) if body else 0
+        is_image_page = body is None and soup.find(attrs={'class': 'article-image'}) is not None
+        no_text = body_len < 300 and not is_image_page
+        return title, section.strip(), intro, author, no_text
+
+    # ------------------------------------------------------------------
+    # Index
+    # ------------------------------------------------------------------
+    def parse_index(self):
+        self._cache = {}
+        edition = self._edition_url()
+        self.log('FD: editie', edition)
+        raw, _ = self._open(edition)
+        soup = self.index_to_soup(raw)
+        dt = soup.find(attrs={'class': 'long-date'})
+        if dt:
+            self.log('FD: krant van', self._text(dt))
+
+        cover, items, pubs = self._parse_edition_page(soup)
+        if cover:
+            self.cover_url = cover
+
+        # Extra publications (supplements); publication 0 is the page we already have.
+        for q in pubs:
+            if q.endswith('=0'):
+                continue
+            try:
+                praw, _ = self._open(edition + q)
+                _, pitems, _ = self._parse_edition_page(self.index_to_soup(praw))
+                items.extend(pitems)
+            except Exception as e:
+                self.log.warn('FD: publicatie', q, 'mislukt:', e)
+
+        # Unique ids, in paper order (publication, page, first appearance)
+        seen, ordered = set(), []
+        for aid, page in items:
+            if aid not in seen:
+                seen.add(aid)
+                ordered.append((aid, page))
+        ordered.sort(key=lambda x: (int(ARTICLE_ID_RE.match(x[0]).group(3)), x[1]))
+        self.log('FD: %d artikelen gevonden' % len(ordered))
+
+        sections, order, locked = {}, [], 0
+        for aid, page in ordered:
+            url = BASE + '/' + aid
+            try:
+                html, final = self._open(url)
+            except Exception as e:
+                self.log.warn('FD: kan', url, 'niet openen:', e)
+                continue
+            asoup = self.index_to_soup(html)
+            title, section, intro, author, no_access = self._article_info(asoup, final)
+            if not title:
+                self.log('FD: geen titel, overgeslagen:', final)
+                continue
+            if no_access:
+                locked += 1
+            pub = int(ARTICLE_ID_RE.match(aid).group(3))
+            if page == 1 and pub == 0:
+                sec_name = 'Voorpagina'
+            elif section:
+                sec_name = section
+            else:
+                sec_name = 'Pagina %d' % page
+            if pub > 0 and page == 1:
+                sec_name = section or 'Bijlage'
+            self._cache[url] = (html, final, sec_name)
+            if sec_name not in sections:
+                sections[sec_name] = []
+                order.append(sec_name)
+            desc = intro
+            if author:
+                desc = (author + ' — ' + intro) if intro else author
+            sections[sec_name].append({
+                'title': title,
+                'url': url,
+                'description': desc,
+                'author': author,
+                'date': '',
+            })
+            self.log('  [p%d] %s: %s' % (page, sec_name, title))
+
+        if locked:
+            self.log.warn('FD: %d van %d artikelen bevatten (bijna) geen tekst; kort stuk of betaalmuur (zie FD_COOKIE)' % (
+                locked, sum(len(v) for v in sections.values())))
+        return [(s, sections[s]) for s in order]
+
+    def get_obfuscated_article(self, url):
+        cached = getattr(self, '_cache', {}).get(url)
+        if cached:
+            html, final, sec = cached
+        else:
+            html, final = self._open(url, self.browser.clone_browser())
+            sec = ''
+        # Pass the section along so it can be shown above the title
+        html = html.replace('<body', '<body data-fd-section="%s"' % sec.replace('"', ''), 1)
+        return {'data': html, 'url': final}
+
+    # ------------------------------------------------------------------
+    # Article cleanup
+    # ------------------------------------------------------------------
+    def preprocess_html(self, soup):
+        body = soup.find('body')
+        sec = body.get('data-fd-section', '') if body else ''
+
+        # Keep only the article itself (or the page clipping for image-only items)
+        keep = (soup.find(attrs={'class': 'article-content'})
+                or soup.find('article')
+                or soup.find(attrs={'class': 'article-image'})
+                or soup.find('main'))
+        if keep is not None and body is not None:
+            keep.extract()
+            body.clear()
+            body.append(keep)
+
+        # Lazy loaded / responsive images -> plain <img src> with a screen sized candidate
+        for pic in soup.findAll('picture'):
+            img = pic.find('img')
+            best = None
+            for s in pic.findAll('source'):
+                best = best or self._best_src(s.get('srcset') or s.get('data-srcset'))
+            if img is not None:
+                best = self._best_src(img.get('srcset') or img.get('data-srcset')) or best
+                if best:
+                    img['src'] = best
+                pic.replace_with(img.extract())
+            else:
+                pic.decompose()
+        for s in soup.findAll('source'):
+            s.decompose()
+        for img in soup.findAll('img'):
+            src = img.get('src') or ''
+            alt = (self._best_src(img.get('srcset') or img.get('data-srcset'))
+                   or img.get('data-src') or img.get('data-original') or img.get('data-lazy-src'))
+            if alt and (not src or src.startswith('data:')):
+                img['src'] = alt
+            if not img.get('src') or img['src'].startswith('data:'):
+                img.decompose()
+
+        # Section label above the title (only if the page has no header with it)
+        if sec and sec != 'Voorpagina' and body is not None and body.find('header') is None:
+            h1 = body.find('h1')
+            if h1 is not None:
+                lab = soup.new_tag('p')
+                lab['class'] = 'fd-section'
+                lab.string = sec
+                h1.insert_before(lab)
+        return soup
+
+    @staticmethod
+    def _best_src(srcset):
+        """Pick the smallest candidate that is at least screen wide, else the largest."""
+        if not srcset:
+            return None
+        cands = []
+        for part in srcset.split(','):
+            bits = part.strip().split()
+            if not bits:
+                continue
+            w = 0
+            if len(bits) > 1:
+                m = re.match(r'(\d+)w', bits[1])
+                if m:
+                    w = int(m.group(1))
+                else:
+                    m = re.match(r'([\d.]+)x', bits[1])
+                    w = int(float(m.group(1)) * 1000) if m else 0
+            cands.append((w, bits[0]))
+        if not cands:
+            return None
+        big = sorted(c for c in cands if c[0] >= SCREEN_W)
+        return (big[0] if big else max(cands))[1]
+
+    def image_url_processor(self, baseurl, url):
+        return urljoin(BASE, url) if url.startswith('/') else url
+
+    # ------------------------------------------------------------------
+    # Images: scale to the Kobo Libra Colour screen, then recompress
+    # ------------------------------------------------------------------
+    def preprocess_image(self, img_data, image_url):
+        try:
+            from calibre.utils.img import scale_image
+            _, _, data = scale_image(img_data, width=SCREEN_W, height=SCREEN_H,
+                                     compression_quality=JPEG_QUALITY)
+            return data
+        except Exception as e:
+            self.log.warn('FD: afbeelding niet verkleind (%s): %s' % (e, image_url))
+            return img_data
